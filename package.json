@@ -57,6 +57,7 @@
     "vitest": "^4.1.10"
   },
   "dependencies": {
+    "@azure/msal-node": "5.4.2",
     "execa": "^8.0.1"
   }
 }

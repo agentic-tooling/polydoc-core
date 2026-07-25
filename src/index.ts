@@ -25,6 +25,31 @@ export {
   SUPPORTED_PANDOC_MAJOR,
 } from "./pandoc.js";
 export type {
+  SharePointAccessTokenProvider,
+  SharePointAccessTokenRequest,
+  SharePointClientSecretAccessTokenProviderOptions,
+  SharePointClientSecretCredentials,
+  SharePointConfidentialClient,
+  SharePointDestinationMapper,
+  SharePointTransportDestination,
+  SharePointTransportErrorCode,
+  SharePointTransportErrorContext,
+  SharePointTransportOptions,
+  SharePointTransportOptionsBase,
+} from "./sharepoint.js";
+export {
+  createSharePointClientSecretAccessTokenProvider,
+  DOCX_MIME_TYPE,
+  encodeSharePointRelativePath,
+  MICROSOFT_GRAPH_DEFAULT_SCOPE,
+  MICROSOFT_GRAPH_V1_BASE_URL,
+  SHAREPOINT_REQUIRED_APPLICATION_PERMISSION,
+  SHAREPOINT_SIMPLE_UPLOAD_MAX_BYTES,
+  SharePointTransport,
+  SharePointTransportError,
+  validateSharePointDocxSize,
+} from "./sharepoint.js";
+export type {
   LocalFileDestinationMapper,
   LocalFileTransportDestination,
   LocalFileTransportOptions,
