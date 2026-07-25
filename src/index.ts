@@ -24,3 +24,12 @@ export {
   PandocError,
   SUPPORTED_PANDOC_MAJOR,
 } from "./pandoc.js";
+export type {
+  LocalFileDestinationMapper,
+  LocalFileTransportDestination,
+  LocalFileTransportOptions,
+  Transport,
+  TransportErrorCode,
+  TransportUploadResult,
+} from "./transport.js";
+export { LocalFileTransport, TransportError } from "./transport.js";

@@ -1,6 +1,6 @@
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { strFromU8, unzipSync } from "fflate";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -11,6 +11,7 @@ import {
   convertMarkdownToDocx,
   DEFAULT_SOURCE_DATE_EPOCH,
   doctor,
+  LocalFileTransport,
   PandocError,
   type PandocRunner,
   SUPPORTED_PANDOC_MAJOR,
@@ -23,6 +24,7 @@ const fixtureReferenceDocxPath = "tests/fixtures/reference/reference.docx";
 
 const realPandocProbe = await doctor();
 const canRepresentUnreadableFiles = process.platform !== "win32" && process.getuid?.() !== 0;
+const requirePandocIntegration = process.env.POLYDOC_REQUIRE_PANDOC === "1";
 
 const tempDirectories: string[] = [];
 const unsupportedMajorOptionRegression: ConvertMarkdownToDocxOptions = {
@@ -537,13 +539,224 @@ describe.skipIf(realPandocProbe.ok)("Pandoc integration skip behavior", () => {
   });
 });
 
+describe.skipIf(!requirePandocIntegration)("Pandoc integration requirement", () => {
+  it("has a supported Pandoc binary when CI requires integration coverage", () => {
+    expect(realPandocProbe).toMatchObject({ ok: true });
+  });
+});
+
+describe("local file transport", () => {
+  it("creates a deterministic DOCX destination for a canonical ID", async () => {
+    const rootDir = await createTempDirectory();
+    const transport = new LocalFileTransport({ rootDir });
+    const result = await transport.upload("teamwiki/basic-note", new TextEncoder().encode("docx"));
+
+    expect(result).toEqual({
+      kind: "local-file",
+      destinationId: join(rootDir, "teamwiki", "basic-note.docx"),
+      path: join(rootDir, "teamwiki", "basic-note.docx"),
+    });
+    expect(await readFile(result.path, "utf8")).toBe("docx");
+  });
+
+  it("overwrites the same path instead of creating duplicate destinations", async () => {
+    const rootDir = await createTempDirectory();
+    const transport = new LocalFileTransport({ rootDir });
+
+    const first = await transport.upload("notes/update", new TextEncoder().encode("first"));
+    const second = await transport.upload("notes/update", new TextEncoder().encode("second"));
+
+    expect(second).toEqual(first);
+    expect(await readFile(first.path, "utf8")).toBe("second");
+  });
+
+  it("resolves safe nested mapped destinations under the configured root", async () => {
+    const rootDir = await createTempDirectory();
+    const transport = new LocalFileTransport({
+      rootDir,
+      mapCanonicalId: (canonicalId) => `published/${canonicalId}/index`,
+    });
+
+    const result = transport.resolveDestination("handbook/intro");
+
+    expect(result).toEqual({
+      kind: "local-file",
+      destinationId: join(rootDir, "published", "handbook", "intro", "index.docx"),
+      path: join(rootDir, "published", "handbook", "intro", "index.docx"),
+    });
+  });
+
+  it("accepts opaque canonical IDs when a custom mapper returns a safe destination", async () => {
+    const rootDir = await createTempDirectory();
+    const seenIds: string[] = [];
+    const transport = new LocalFileTransport({
+      rootDir,
+      mapCanonicalId: (canonicalId) => {
+        seenIds.push(canonicalId);
+        return "opaque/teamwiki-note-123";
+      },
+    });
+
+    const result = await transport.upload(
+      "urn:teamwiki:note:123",
+      new TextEncoder().encode("docx"),
+    );
+
+    expect(seenIds).toEqual(["urn:teamwiki:note:123"]);
+    expect(result.path).toBe(join(rootDir, "opaque", "teamwiki-note-123.docx"));
+    expect(await readFile(result.path, "utf8")).toBe("docx");
+  });
+
+  it("does not treat relative paths starting with '..' characters as parent traversal", async () => {
+    const rootDir = await createTempDirectory();
+    const transport = new LocalFileTransport({ rootDir });
+
+    const result = await transport.upload("..safe/note", new TextEncoder().encode("docx"));
+
+    expect(result.path).toBe(join(rootDir, "..safe", "note.docx"));
+    expect(await readFile(result.path, "utf8")).toBe("docx");
+  });
+
+  it("preserves an explicit .docx extension from the mapped destination", async () => {
+    const rootDir = await createTempDirectory();
+    const transport = new LocalFileTransport({
+      rootDir,
+      mapCanonicalId: () => "exports/final.DOCX",
+    });
+
+    const result = await transport.upload("final", new TextEncoder().encode("docx"));
+
+    expect(result.path).toBe(join(rootDir, "exports", "final.DOCX"));
+  });
+
+  it.each(["", "   ", " leading", "trailing ", "bad\0id"])(
+    "rejects invalid canonical ID %j",
+    async (canonicalId) => {
+      const transport = new LocalFileTransport({ rootDir: await createTempDirectory() });
+
+      await expect(transport.upload(canonicalId, new Uint8Array())).rejects.toMatchObject({
+        name: "TransportError",
+        code: "TRANSPORT_ID_INVALID",
+      });
+    },
+  );
+
+  it.each([
+    "../secret",
+    "team/../secret",
+    "team//secret",
+    "./secret",
+    "/absolute",
+    "C:/absolute",
+    "C:relative",
+    String.raw`team\secret`,
+  ])("rejects default-mapped canonical ID %j as an unsafe destination", async (canonicalId) => {
+    const transport = new LocalFileTransport({ rootDir: await createTempDirectory() });
+
+    await expect(transport.upload(canonicalId, new Uint8Array())).rejects.toMatchObject({
+      name: "TransportError",
+      code: "TRANSPORT_DESTINATION_INVALID",
+    });
+  });
+
+  it.each([
+    "../outside",
+    "safe/../../outside",
+    "/absolute",
+    "C:/absolute",
+    "C:relative",
+    String.raw`safe\outside`,
+    "safe//outside",
+    "bad\0destination",
+    "CON.docx",
+    "COM1",
+    "name?",
+    "name*",
+    "trailing.",
+    "nested/trailing ",
+    "AUX",
+    "LPT9.txt",
+    "control\u001Fchar",
+  ])("rejects unsafe mapped destination %j", (mappedDestination) => {
+    const transport = new LocalFileTransport({
+      rootDir: resolve("/tmp/polydoc-root"),
+      mapCanonicalId: () => mappedDestination,
+    });
+
+    expect(() => transport.resolveDestination("safe")).toThrow(
+      expect.objectContaining({
+        name: "TransportError",
+        code: "TRANSPORT_DESTINATION_INVALID",
+      }),
+    );
+  });
+
+  it("wraps mapper failures with an actionable typed error and original cause", async () => {
+    const cause = new Error("mapper exploded");
+    const transport = new LocalFileTransport({
+      rootDir: await createTempDirectory(),
+      mapCanonicalId: () => {
+        throw cause;
+      },
+    });
+
+    await expect(transport.upload("opaque:id", new Uint8Array())).rejects.toMatchObject({
+      name: "TransportError",
+      code: "TRANSPORT_DESTINATION_INVALID",
+      guidance: expect.stringContaining("mapCanonicalId"),
+      cause,
+    });
+  });
+
+  it("snapshots DOCX bytes before asynchronous writes can observe caller mutation", async () => {
+    const rootDir = await createTempDirectory();
+    const transport = new LocalFileTransport({ rootDir });
+    const bytes = new TextEncoder().encode("before");
+
+    const upload = transport.upload("snapshot", bytes);
+    bytes.fill("x".charCodeAt(0));
+    const result = await upload;
+
+    expect(await readFile(result.path, "utf8")).toBe("before");
+  });
+
+  it("wraps write failures with an actionable typed error and original cause", async () => {
+    const rootDir = join(await createTempDirectory(), "file-root");
+    await writeFile(rootDir, "not a directory");
+    const transport = new LocalFileTransport({ rootDir });
+
+    await expect(transport.upload("doc", new Uint8Array([1, 2, 3]))).rejects.toMatchObject({
+      name: "TransportError",
+      code: "TRANSPORT_WRITE_FAILED",
+      guidance: expect.stringContaining("rootDir"),
+      cause: expect.objectContaining({ code: expect.any(String) }),
+    });
+  });
+
+  it("rejects an empty local root", () => {
+    expect(() => new LocalFileTransport({ rootDir: " " })).toThrow(
+      expect.objectContaining({
+        name: "TransportError",
+        code: "TRANSPORT_ROOT_INVALID",
+      }),
+    );
+  });
+});
+
 async function createTempDocx(name: string): Promise<string> {
-  const tempDirectory = await mkdtemp(join(tmpdir(), "polydoc-core-test-"));
-  tempDirectories.push(tempDirectory);
+  const tempDirectory = await createTempDirectory();
   const docxPath = join(tempDirectory, name);
+  await mkdir(join(docxPath, ".."), { recursive: true });
   await writeFile(docxPath, "fake docx");
 
   return docxPath;
+}
+
+async function createTempDirectory(): Promise<string> {
+  const tempDirectory = await mkdtemp(join(tmpdir(), "polydoc-core-test-"));
+  tempDirectories.push(tempDirectory);
+
+  return tempDirectory;
 }
 
 function createSuccessfulDoctorRunner(): PandocRunner {

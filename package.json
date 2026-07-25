@@ -5,7 +5,7 @@
   "type": "module",
   "license": "MIT",
   "author": "Logan Lindquist Land",
-  "packageManager": "pnpm@11.9.0",
+  "packageManager": "pnpm@10.34.5",
   "engines": {
     "node": ">=20"
   },
@@ -45,7 +45,7 @@
     "lint": "biome check .",
     "format": "biome format --write .",
     "format:check": "biome format .",
-    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
+    "check": "biome check . && tsc -p tsconfig.json --noEmit && vitest run && tsc -p tsconfig.build.json",
     "prepack": "pnpm build"
   },
   "devDependencies": {
