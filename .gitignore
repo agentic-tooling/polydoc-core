@@ -3,6 +3,7 @@ node_modules/
 dist/
 coverage/
 *.tsbuildinfo
+/.pnpm-store/
 
 # Local environment and OS files
 .env

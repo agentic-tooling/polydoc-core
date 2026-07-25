@@ -94,6 +94,110 @@ hostile symlinks.
 Transport failures throw `TransportError` with a stable `code`, actionable
 `guidance`, and the original `cause` when filesystem or mapper operations fail.
 
+### SharePoint Transport
+
+`SharePointTransport` publishes DOCX bytes to a SharePoint document library via
+Microsoft Graph app-only auth. It implements the same create-or-update
+`Transport.upload(canonicalId, docx)` contract as `LocalFileTransport`.
+
+```ts
+import {
+  SharePointTransport,
+  convertMarkdownToDocx,
+} from "@agentic-tooling/polydoc-core";
+
+const docx = await convertMarkdownToDocx({
+  markdown,
+  referenceDocxPath: "./reference.docx",
+});
+
+const transport = new SharePointTransport({
+  siteId: "contoso.sharepoint.com,site-collection-id,site-id",
+  driveId: "document-library-drive-id",
+  baseFolder: "TeamWiki",
+  tenantId,
+  clientId,
+  clientSecret,
+  mapCanonicalId: (canonicalId) => `published/${canonicalId}`,
+});
+
+const destination = await transport.upload("handbook/intro", docx);
+
+console.log(destination.destinationId); // Microsoft Graph driveItem id
+console.log(destination.path); // TeamWiki/published/handbook/intro.docx
+console.log(destination.webUrl); // optional Graph driveItem webUrl
+```
+
+Auth uses `@azure/msal-node` with the Microsoft Graph scope
+`https://graph.microsoft.com/.default`. `Sites.Selected` is the required Entra
+application permission to admin-consent on the app registration, and a separate
+site-specific `write` grant must be provisioned out of band. The library does
+not request `Sites.Selected` as an OAuth scope, does not require
+tenant-wide `Sites.ReadWrite.All`, does not provision site grants, and does not
+verify token roles.
+
+Typical setup is:
+
+- Create or reuse an Entra app registration and client credential.
+- Add the Microsoft Graph application permission `Sites.Selected` and grant
+  tenant admin consent.
+- Grant that app `write` permission to the target SharePoint site using the
+  Microsoft Graph site permissions API or an equivalent admin process.
+- Pass `tenantId`, `clientId`, and `clientSecret` from the consuming
+  application. This package never reads environment variables directly and does
+  not log or expose secrets.
+
+Consumers that use managed identity, certificates, or their own token cache can
+pass `accessTokenProvider` instead of client-secret fields. The constructor
+rejects configurations that provide both auth shapes.
+
+Uploads use Microsoft Graph simple upload:
+
+```txt
+PUT /v1.0/sites/{site-id}/drives/{drive-id}/root:/{relative-path}:/content
+```
+
+The body is the DOCX bytes with DOCX content type. Every 2xx response is treated
+as success, but the response body must include a non-empty Graph driveItem `id`.
+The returned `destinationId` and `driveItemId` are that stable Graph ID, which
+callers should persist if they need a durable handle. Re-uploading the same
+canonical ID maps to the same relative path and lets SharePoint/Graph update the
+existing item/version history by path; the library does not keep local upload
+state.
+
+Path mapping is deterministic. By default, a path-safe canonical ID becomes the
+relative SharePoint destination. `mapCanonicalId` can map opaque IDs such as
+`urn:teamwiki:note:123` to a SharePoint-safe relative path. `.docx` is appended
+once, `baseFolder` is prepended when provided, and the final decoded destination
+is validated before auth or network work. Path segments are encoded
+individually, so spaces, `#`, and `%` are percent-encoded instead of corrupting
+the URL.
+
+Destination validation rejects traversal, empty segments, control characters,
+segments with leading or trailing whitespace, decoded segments over 255
+characters, decoded relative paths over 400 characters, double quote, `*`, `:`,
+`<`, `>`, `?`, `\`, `|`, structural slash misuse, names beginning with `~` or
+`~$`, segments ending with `.`, Windows device names including `COM0`-`COM9` and
+`LPT0`-`LPT9`, `.lock`, `desktop.ini`, names containing `_vti_`, and root-level
+`Forms`. The 400-character check applies to the library-relative destination;
+SharePoint's actual decoded full-path limit also includes the site and document
+library prefix, so Microsoft Graph can still reject a shorter relative path in a
+deep site or library.
+
+Microsoft Graph simple upload supports files up to 250 MB. `SharePointTransport`
+checks this limit before token acquisition or upload. This package only supports
+forward Markdown-to-DOCX publishing; it does not import, diff, or reverse-convert
+SharePoint documents.
+
+Microsoft references:
+
+- [Client credentials and `.default`](https://learn.microsoft.com/en-us/graph/auth-v2-service)
+- [MSAL Node client credential requests](https://learn.microsoft.com/en-us/entra/msal/javascript/node/acquire-token-requests)
+- [Sites.Selected permission](https://learn.microsoft.com/en-us/graph/permissions-reference#sitesselected)
+- [Site-specific permission grants](https://learn.microsoft.com/en-us/graph/api/site-post-permissions?view=graph-rest-1.0)
+- [DriveItem simple upload](https://learn.microsoft.com/en-us/graph/api/driveitem-put-content?view=graph-rest-1.0)
+- [OneDrive/SharePoint path addressing](https://learn.microsoft.com/en-us/graph/onedrive-addressing-driveitems)
+
 ## Pandoc Contract
 
 This package shells out to the system `pandoc` binary through `execa` with an

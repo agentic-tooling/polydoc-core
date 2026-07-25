@@ -9,12 +9,24 @@ import {
   applyMarkdownPreprocessors,
   type ConvertMarkdownToDocxOptions,
   convertMarkdownToDocx,
+  createSharePointClientSecretAccessTokenProvider,
   DEFAULT_SOURCE_DATE_EPOCH,
+  DOCX_MIME_TYPE,
   doctor,
+  encodeSharePointRelativePath,
   LocalFileTransport,
+  MICROSOFT_GRAPH_DEFAULT_SCOPE,
   PandocError,
   type PandocRunner,
+  SHAREPOINT_REQUIRED_APPLICATION_PERMISSION,
+  SHAREPOINT_SIMPLE_UPLOAD_MAX_BYTES,
+  type SharePointAccessTokenProvider,
+  type SharePointConfidentialClient,
+  SharePointTransport,
+  SharePointTransportError,
+  type SharePointTransportOptions,
   SUPPORTED_PANDOC_MAJOR,
+  validateSharePointDocxSize,
 } from "../src/index.js";
 
 const fixtureInputPath = "tests/fixtures/golden/publish/basic-note/input.md";
@@ -743,6 +755,487 @@ describe("local file transport", () => {
   });
 });
 
+describe("SharePoint transport", () => {
+  it("uses MSAL client-credential token requests with exactly the Microsoft Graph .default scope", async () => {
+    const clientApplication: SharePointConfidentialClient = {
+      acquireTokenByClientCredential: vi.fn(async () => ({ accessToken: "token" })),
+    };
+    const provider = createSharePointClientSecretAccessTokenProvider({
+      tenantId: "tenant-id",
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      clientApplication,
+    });
+
+    await expect(provider({ scopes: [MICROSOFT_GRAPH_DEFAULT_SCOPE] })).resolves.toBe("token");
+
+    expect(clientApplication.acquireTokenByClientCredential).toHaveBeenCalledWith({
+      scopes: [MICROSOFT_GRAPH_DEFAULT_SCOPE],
+    });
+    expect(MICROSOFT_GRAPH_DEFAULT_SCOPE).toBe("https://graph.microsoft.com/.default");
+    expect(SHAREPOINT_REQUIRED_APPLICATION_PERMISSION).toBe("Sites.Selected");
+  });
+
+  it("treats client secrets as opaque non-empty strings with normal punctuation", () => {
+    const clientApplication: SharePointConfidentialClient = {
+      acquireTokenByClientCredential: vi.fn(async () => ({ accessToken: "token" })),
+    };
+
+    expect(() =>
+      createSharePointClientSecretAccessTokenProvider({
+        tenantId: "tenant-id",
+        clientId: "client-id",
+        clientSecret: "opaque/secret:with?punctuation|#% and spaces",
+        clientApplication,
+      }),
+    ).not.toThrow();
+    expect(
+      () =>
+        new SharePointTransport({
+          siteId: "site-id",
+          driveId: "drive-id",
+          tenantId: "tenant-id",
+          clientId: "client-id",
+          clientSecret: "opaque/secret:with?punctuation|#% and spaces",
+        }),
+    ).not.toThrow();
+  });
+
+  it("does not attach secret-bearing MSAL failures as auth error causes", async () => {
+    const secretBearingCause = new Error("client-secret-value");
+    const clientApplication: SharePointConfidentialClient = {
+      acquireTokenByClientCredential: vi.fn(async () => {
+        throw secretBearingCause;
+      }),
+    };
+    const provider = createSharePointClientSecretAccessTokenProvider({
+      tenantId: "tenant-id",
+      clientId: "client-id",
+      clientSecret: "client-secret-value",
+      clientApplication,
+    });
+
+    await expect(provider({ scopes: [MICROSOFT_GRAPH_DEFAULT_SCOPE] })).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof SharePointTransportError &&
+        error.code === "SHAREPOINT_AUTH_FAILED" &&
+        error.cause === undefined &&
+        !String(error).includes("client-secret-value"),
+    );
+  });
+
+  it("PUTs a DOCX body to the encoded Graph path with bearer auth and content type", async () => {
+    const calls: FetchCall[] = [];
+    const transport = createSharePointTransport({
+      fetchImpl: createSuccessfulSharePointFetch(calls, { id: "drive-item-1" }),
+    });
+    const docx = new Uint8Array([1, 2, 3]);
+
+    const result = await transport.upload("Team Docs/#plan 100%", docx);
+
+    expect(result).toEqual({
+      kind: "sharepoint",
+      destinationId: "drive-item-1",
+      driveItemId: "drive-item-1",
+      path: "Team Docs/#plan 100%.docx",
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual({
+      url: "https://graph.microsoft.com/v1.0/sites/site%20id%23100%25/drives/drive%20id%23100%25/root:/Team%20Docs/%23plan%20100%25.docx:/content",
+      method: "PUT",
+      authorization: "Bearer test-token",
+      contentType: DOCX_MIME_TYPE,
+      body: [1, 2, 3],
+    });
+  });
+
+  it("snapshots DOCX bytes before asynchronous token and network work", async () => {
+    const calls: FetchCall[] = [];
+    let releaseToken: ((token: string) => void) | undefined;
+    const accessTokenProvider: SharePointAccessTokenProvider = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          releaseToken = resolve;
+        }),
+    );
+    const transport = createSharePointTransport({
+      accessTokenProvider,
+      fetchImpl: createSuccessfulSharePointFetch(calls, { id: "snapshot-id" }),
+    });
+    const docx = new Uint8Array([1, 2, 3]);
+
+    const upload = transport.upload("snapshot", docx);
+    docx.fill(9);
+    releaseToken?.("test-token");
+    await upload;
+
+    expect(calls[0]?.body).toEqual([1, 2, 3]);
+  });
+
+  it("repeated uploads to the same canonical ID use the same URL and stable driveItem ID", async () => {
+    const calls: FetchCall[] = [];
+    const transport = createSharePointTransport({
+      fetchImpl: createSuccessfulSharePointFetch(calls, { id: "stable-drive-item-id" }),
+    });
+
+    const first = await transport.upload("stable/path", new Uint8Array([1]));
+    const second = await transport.upload("stable/path", new Uint8Array([2]));
+
+    expect(first.driveItemId).toBe("stable-drive-item-id");
+    expect(second.driveItemId).toBe("stable-drive-item-id");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.url).toBe(calls[0]?.url);
+    expect(calls[1]?.method).toBe("PUT");
+  });
+
+  it("supports custom opaque ID mapping, base folders, and .docx extension handling", async () => {
+    const calls: FetchCall[] = [];
+    const seenIds: string[] = [];
+    const transport = createSharePointTransport({
+      baseFolder: "Published Docs",
+      fetchImpl: createSuccessfulSharePointFetch(calls, {
+        id: "opaque-id",
+        webUrl: "https://tenant.sharepoint.com/sites/wiki/Shared%20Documents/opaque.docx",
+        eTag: '"etag"',
+      }),
+      mapCanonicalId: (canonicalId) => {
+        seenIds.push(canonicalId);
+        return "Opaque IDs/note-123.DOCX";
+      },
+    });
+
+    const result = await transport.upload("urn:teamwiki:note:123", new Uint8Array([1]));
+
+    expect(seenIds).toEqual(["urn:teamwiki:note:123"]);
+    expect(result).toEqual({
+      kind: "sharepoint",
+      destinationId: "opaque-id",
+      driveItemId: "opaque-id",
+      path: "Published Docs/Opaque IDs/note-123.DOCX",
+      webUrl: "https://tenant.sharepoint.com/sites/wiki/Shared%20Documents/opaque.docx",
+      eTag: '"etag"',
+    });
+    expect(calls[0]?.url).toContain("/root:/Published%20Docs/Opaque%20IDs/note-123.DOCX:/content");
+  });
+
+  it("encodes supported spaces, hash, and percent characters per path segment", () => {
+    expect(encodeSharePointRelativePath("Team Docs/#plan 100%.docx")).toBe(
+      "Team%20Docs/%23plan%20100%25.docx",
+    );
+  });
+
+  it.each([
+    [
+      "empty site ID",
+      () =>
+        ({
+          siteId: "",
+          driveId: "drive-id",
+          accessTokenProvider: async () => "token",
+        }) as SharePointTransportOptions,
+    ],
+    [
+      "empty drive ID",
+      () =>
+        ({
+          siteId: "site-id",
+          driveId: " ",
+          accessTokenProvider: async () => "token",
+        }) as SharePointTransportOptions,
+    ],
+    [
+      "mixed provider and credentials",
+      () =>
+        ({
+          siteId: "site-id",
+          driveId: "drive-id",
+          accessTokenProvider: async () => "token",
+          tenantId: "tenant",
+          clientId: "client",
+          clientSecret: "secret",
+        }) as unknown as SharePointTransportOptions,
+    ],
+    [
+      "missing auth",
+      () =>
+        ({
+          siteId: "site-id",
+          driveId: "drive-id",
+        }) as unknown as SharePointTransportOptions,
+    ],
+  ])("rejects invalid config: %s", (_label, buildOptions) => {
+    expect(() => new SharePointTransport(buildOptions())).toThrow(
+      expect.objectContaining({
+        name: "SharePointTransportError",
+        code: "SHAREPOINT_CONFIG_INVALID",
+      }),
+    );
+  });
+
+  it.each(["", "  ", " leading", "trailing ", "bad\0id"])(
+    "rejects invalid canonical ID %j",
+    async (canonicalId) => {
+      const transport = createSharePointTransport();
+
+      await expect(transport.upload(canonicalId, new Uint8Array([1]))).rejects.toMatchObject({
+        name: "SharePointTransportError",
+        code: "SHAREPOINT_PATH_INVALID",
+      });
+    },
+  );
+
+  it.each([
+    "../secret",
+    "team/../secret",
+    "team//secret",
+    "./secret",
+    "/absolute",
+    String.raw`team\secret`,
+    "name?",
+    "name*",
+    "name<",
+    "name>",
+    'name"',
+    "name:",
+    "name|",
+    "~temporary",
+    "~$temporary",
+    "folder/trailing.",
+    "CON",
+    "COM0",
+    "LPT1.docx",
+    "LPT0.docx",
+    ".lock",
+    "desktop.ini",
+    "Team/_vti_/note",
+  ])("rejects unsafe SharePoint destination %j", async (mappedDestination) => {
+    const transport = createSharePointTransport({
+      mapCanonicalId: () => mappedDestination,
+    });
+
+    await expect(transport.upload("safe", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "SharePointTransportError",
+      code: "SHAREPOINT_PATH_INVALID",
+    });
+  });
+
+  it.each([
+    ["base folder trailing whitespace segment", { baseFolder: "TeamWiki /Published" }],
+    ["mapped nested leading whitespace segment", { mapCanonicalId: (): string => "Team/ note" }],
+    ["mapped nested trailing whitespace segment", { mapCanonicalId: (): string => "Team/note " }],
+    [
+      "root-level Forms folder after final combination",
+      { mapCanonicalId: (): string => "Forms/note" },
+    ],
+    [
+      "root-level Forms base folder after final combination",
+      { baseFolder: "Forms", mapCanonicalId: (): string => "note" },
+    ],
+    [
+      "appended extension blocked .lock final destination",
+      { mapCanonicalId: (): string => ".lock" },
+    ],
+    [
+      "appended extension blocked desktop.ini final destination",
+      { mapCanonicalId: (): string => "desktop.ini" },
+    ],
+  ])("rejects unsafe final SharePoint destination: %s", async (_label, options) => {
+    const transport = createSharePointTransport(options);
+
+    await expect(transport.upload("safe", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "SharePointTransportError",
+      code: "SHAREPOINT_PATH_INVALID",
+    });
+  });
+
+  it("rejects decoded SharePoint path segments longer than 255 characters", async () => {
+    const transport = createSharePointTransport({
+      mapCanonicalId: () => "a".repeat(256),
+    });
+
+    await expect(transport.upload("safe", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "SharePointTransportError",
+      code: "SHAREPOINT_PATH_INVALID",
+    });
+  });
+
+  it("rejects decoded SharePoint relative paths longer than 400 characters", async () => {
+    const transport = createSharePointTransport({
+      baseFolder: "a".repeat(200),
+      mapCanonicalId: () => `${"b".repeat(196)}.docx`,
+    });
+
+    await expect(transport.upload("safe", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "SharePointTransportError",
+      code: "SHAREPOINT_PATH_INVALID",
+    });
+  });
+
+  it("enforces the 250 MB simple-upload cap without allocating a 250 MB DOCX", () => {
+    expect(() => validateSharePointDocxSize(SHAREPOINT_SIMPLE_UPLOAD_MAX_BYTES)).not.toThrow();
+    expect(() => validateSharePointDocxSize(SHAREPOINT_SIMPLE_UPLOAD_MAX_BYTES + 1)).toThrow(
+      expect.objectContaining({
+        name: "SharePointTransportError",
+        code: "SHAREPOINT_DOCX_TOO_LARGE",
+      }),
+    );
+  });
+
+  it("guards upload size before auth or network work", async () => {
+    const accessTokenProvider = vi.fn(async () => "token");
+    const fetchImpl = vi.fn<typeof fetch>();
+    const transport = createSharePointTransport({ accessTokenProvider, fetchImpl });
+    const tooLarge = { byteLength: SHAREPOINT_SIMPLE_UPLOAD_MAX_BYTES + 1 } as Uint8Array;
+
+    await expect(transport.upload("too-large", tooLarge)).rejects.toMatchObject({
+      name: "SharePointTransportError",
+      code: "SHAREPOINT_DOCX_TOO_LARGE",
+    });
+    expect(accessTokenProvider).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("wraps auth failures without exposing tokens or secrets in the error string", async () => {
+    const secretBearingCause = new Error("secret-value");
+    const transport = createSharePointTransport({
+      accessTokenProvider: async () => {
+        throw secretBearingCause;
+      },
+    });
+
+    await expect(transport.upload("auth", new Uint8Array([1]))).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof SharePointTransportError &&
+        error.code === "SHAREPOINT_AUTH_FAILED" &&
+        error.cause === undefined &&
+        !String(error).includes("secret-value"),
+    );
+  });
+
+  it("wraps network failures without exposing bearer tokens in the error string", async () => {
+    const tokenBearingCause = new Error("test-token");
+    const transport = createSharePointTransport({
+      accessTokenProvider: async () => "test-token",
+      fetchImpl: async () => {
+        throw tokenBearingCause;
+      },
+    });
+
+    await expect(transport.upload("network", new Uint8Array([1]))).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof SharePointTransportError &&
+        error.code === "SHAREPOINT_NETWORK_FAILED" &&
+        error.cause === undefined &&
+        !String(error).includes("test-token"),
+    );
+  });
+
+  it("returns bounded Graph error context for non-2xx responses without leaking body text", async () => {
+    const transport = createSharePointTransport({
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: "accessDenied",
+              message: "test-token secret-value",
+            },
+          }),
+          {
+            status: 403,
+            headers: {
+              "request-id": "request-123",
+            },
+          },
+        ),
+    });
+
+    await expect(transport.upload("denied", new Uint8Array([1]))).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof SharePointTransportError &&
+        error.code === "SHAREPOINT_HTTP_FAILED" &&
+        error.context?.status === 403 &&
+        error.context.requestId === "request-123" &&
+        error.context.graphErrorCode === "accessDenied" &&
+        !String(error).includes("test-token") &&
+        !String(error).includes("secret-value"),
+    );
+  });
+
+  it("sanitizes Graph request IDs and error codes before adding them to errors", async () => {
+    const transport = createSharePointTransport({
+      fetchImpl: async () =>
+        ({
+          ok: false,
+          status: 429,
+          headers: {
+            get: (name: string) =>
+              name.toLowerCase() === "request-id" ? "request-\n123\u007F" : null,
+          },
+          text: async () =>
+            JSON.stringify({
+              error: {
+                code: "tooMany\nRequests\u007F",
+              },
+            }),
+        }) as Response,
+    });
+
+    await expect(transport.upload("throttled", new Uint8Array([1]))).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof SharePointTransportError &&
+        error.code === "SHAREPOINT_HTTP_FAILED" &&
+        error.context?.requestId === "request-123" &&
+        error.context.graphErrorCode === "tooManyRequests" &&
+        !String(error).includes("\n") &&
+        !String(error).includes("\u007F"),
+    );
+  });
+
+  it("does not treat x-ms-ags-diagnostic as a Graph request ID", async () => {
+    const transport = createSharePointTransport({
+      fetchImpl: async () =>
+        new Response(JSON.stringify({ error: { code: "accessDenied" } }), {
+          status: 403,
+          headers: {
+            "x-ms-ags-diagnostic": "diagnostic-should-not-be-request-id",
+          },
+        }),
+    });
+
+    await expect(transport.upload("denied", new Uint8Array([1]))).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof SharePointTransportError &&
+        error.code === "SHAREPOINT_HTTP_FAILED" &&
+        error.context?.requestId === undefined,
+    );
+  });
+
+  it("rejects invalid JSON and missing driveItem IDs", async () => {
+    const invalidJsonTransport = createSharePointTransport({
+      fetchImpl: async () => new Response("not-json secret-value", { status: 200 }),
+    });
+    const missingIdTransport = createSharePointTransport({
+      fetchImpl: async () => Response.json({ name: "missing id" }, { status: 201 }),
+    });
+
+    await expect(
+      invalidJsonTransport.upload("invalid-json", new Uint8Array([1])),
+    ).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof SharePointTransportError &&
+        error.code === "SHAREPOINT_RESPONSE_INVALID" &&
+        error.cause === undefined &&
+        !String(error).includes("secret-value"),
+    );
+    await expect(
+      missingIdTransport.upload("missing-id", new Uint8Array([1])),
+    ).rejects.toMatchObject({
+      name: "SharePointTransportError",
+      code: "SHAREPOINT_RESPONSE_INVALID",
+    });
+  });
+});
+
 async function createTempDocx(name: string): Promise<string> {
   const tempDirectory = await createTempDirectory();
   const docxPath = join(tempDirectory, name);
@@ -757,6 +1250,80 @@ async function createTempDirectory(): Promise<string> {
   tempDirectories.push(tempDirectory);
 
   return tempDirectory;
+}
+
+interface FetchCall {
+  readonly url: string;
+  readonly method: string | undefined;
+  readonly authorization: string | undefined;
+  readonly contentType: string | undefined;
+  readonly body: readonly number[];
+}
+
+function createSharePointTransport(
+  options: {
+    readonly accessTokenProvider?: SharePointAccessTokenProvider;
+    readonly baseFolder?: string;
+    readonly fetchImpl?: typeof fetch;
+    readonly mapCanonicalId?: (canonicalId: string) => string;
+  } = {},
+): SharePointTransport {
+  let transportOptions: SharePointTransportOptions = {
+    siteId: "site id#100%",
+    driveId: "drive id#100%",
+    accessTokenProvider: options.accessTokenProvider ?? (async () => "test-token"),
+    fetch: options.fetchImpl ?? createSuccessfulSharePointFetch([], { id: "drive-item" }),
+  };
+
+  if (options.baseFolder !== undefined) {
+    transportOptions = { ...transportOptions, baseFolder: options.baseFolder };
+  }
+
+  if (options.mapCanonicalId !== undefined) {
+    transportOptions = { ...transportOptions, mapCanonicalId: options.mapCanonicalId };
+  }
+
+  return new SharePointTransport(transportOptions);
+}
+
+function createSuccessfulSharePointFetch(
+  calls: FetchCall[],
+  driveItem: {
+    readonly id: string;
+    readonly webUrl?: string;
+    readonly eTag?: string;
+  },
+): typeof fetch {
+  return async (input, init) => {
+    const headers = new Headers(init?.headers);
+    const body = init?.body;
+
+    calls.push({
+      url: String(input),
+      method: init?.method,
+      authorization: headers.get("Authorization") ?? undefined,
+      contentType: headers.get("Content-Type") ?? undefined,
+      body: body instanceof Uint8Array ? [...body] : [],
+    });
+
+    const responseBody: {
+      id: string;
+      webUrl?: string;
+      eTag?: string;
+    } = {
+      id: driveItem.id,
+    };
+
+    if (driveItem.webUrl !== undefined) {
+      responseBody.webUrl = driveItem.webUrl;
+    }
+
+    if (driveItem.eTag !== undefined) {
+      responseBody.eTag = driveItem.eTag;
+    }
+
+    return Response.json(responseBody, { status: 201 });
+  };
 }
 
 function createSuccessfulDoctorRunner(): PandocRunner {
