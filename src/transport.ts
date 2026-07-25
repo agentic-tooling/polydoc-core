@@ -7,6 +7,13 @@ export type TransportErrorCode =
   | "TRANSPORT_DESTINATION_INVALID"
   | "TRANSPORT_DESTINATION_OUTSIDE_ROOT"
   | "TRANSPORT_WRITE_FAILED"
+  | "GOOGLE_DRIVE_CONFIG_INVALID"
+  | "GOOGLE_DRIVE_AUTH_FAILED"
+  | "GOOGLE_DRIVE_NAME_INVALID"
+  | "GOOGLE_DRIVE_DOCX_TOO_LARGE"
+  | "GOOGLE_DRIVE_NETWORK_FAILED"
+  | "GOOGLE_DRIVE_API_FAILED"
+  | "GOOGLE_DRIVE_RESPONSE_INVALID"
   | "SHAREPOINT_CONFIG_INVALID"
   | "SHAREPOINT_AUTH_FAILED"
   | "SHAREPOINT_PATH_INVALID"
@@ -14,6 +21,9 @@ export type TransportErrorCode =
   | "SHAREPOINT_NETWORK_FAILED"
   | "SHAREPOINT_HTTP_FAILED"
   | "SHAREPOINT_RESPONSE_INVALID";
+
+export const DOCX_MIME_TYPE =
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 
 export interface TransportUploadResult {
   readonly destinationId: string;

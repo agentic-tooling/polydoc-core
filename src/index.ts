@@ -1,4 +1,29 @@
 export type {
+  GoogleDriveAuthClient,
+  GoogleDriveCreateFileParams,
+  GoogleDriveExistingFileIdResolver,
+  GoogleDriveFileMetadata,
+  GoogleDriveFileResponse,
+  GoogleDriveFilesClient,
+  GoogleDriveMediaBody,
+  GoogleDriveNameMapper,
+  GoogleDriveTransportDestination,
+  GoogleDriveTransportErrorCode,
+  GoogleDriveTransportErrorContext,
+  GoogleDriveTransportOptions,
+  GoogleDriveTransportOptionsBase,
+  GoogleDriveUpdateFileParams,
+} from "./google.js";
+export {
+  defaultGoogleDocName,
+  GOOGLE_DOC_MIME_TYPE,
+  GOOGLE_DRIVE_DOCX_IMPORT_MAX_BYTES,
+  GOOGLE_DRIVE_FILE_SCOPE,
+  GoogleDriveTransport,
+  GoogleDriveTransportError,
+  validateGoogleDriveDocxSize,
+} from "./google.js";
+export type {
   ConvertMarkdownToDocxOptions,
   MarkdownPostprocessor,
   MarkdownPreprocessor,

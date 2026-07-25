@@ -1,12 +1,12 @@
 import { ConfidentialClientApplication } from "@azure/msal-node";
 
 import type { Transport, TransportUploadResult } from "./transport.js";
-import { TransportError, type TransportErrorCode } from "./transport.js";
+import { DOCX_MIME_TYPE, TransportError, type TransportErrorCode } from "./transport.js";
+
+export { DOCX_MIME_TYPE };
 
 export const MICROSOFT_GRAPH_DEFAULT_SCOPE = "https://graph.microsoft.com/.default";
 export const SHAREPOINT_REQUIRED_APPLICATION_PERMISSION = "Sites.Selected";
-export const DOCX_MIME_TYPE =
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 export const SHAREPOINT_SIMPLE_UPLOAD_MAX_BYTES = 250 * 1024 * 1024;
 export const MICROSOFT_GRAPH_V1_BASE_URL = "https://graph.microsoft.com/v1.0";
 

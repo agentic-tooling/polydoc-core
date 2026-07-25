@@ -1,7 +1,9 @@
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { strFromU8, unzipSync } from "fflate";
+import { OAuth2Client } from "google-auth-library";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -12,8 +14,20 @@ import {
   createSharePointClientSecretAccessTokenProvider,
   DEFAULT_SOURCE_DATE_EPOCH,
   DOCX_MIME_TYPE,
+  defaultGoogleDocName,
   doctor,
   encodeSharePointRelativePath,
+  GOOGLE_DOC_MIME_TYPE,
+  GOOGLE_DRIVE_DOCX_IMPORT_MAX_BYTES,
+  GOOGLE_DRIVE_FILE_SCOPE,
+  type GoogleDriveCreateFileParams,
+  type GoogleDriveFileMetadata,
+  type GoogleDriveFileResponse,
+  type GoogleDriveFilesClient,
+  GoogleDriveTransport,
+  GoogleDriveTransportError,
+  type GoogleDriveTransportOptions,
+  type GoogleDriveUpdateFileParams,
   LocalFileTransport,
   MICROSOFT_GRAPH_DEFAULT_SCOPE,
   PandocError,
@@ -28,6 +42,13 @@ import {
   SUPPORTED_PANDOC_MAJOR,
   validateSharePointDocxSize,
 } from "../src/index.js";
+
+// The only module mock in this suite. GoogleDriveTransport imports
+// @googleapis/drive lazily and memoizes the client it builds, so that path is
+// unreachable through dependency injection; every other seam stays DI.
+const googleDriveModuleMock = vi.hoisted(() => ({ drive: vi.fn() }));
+
+vi.mock("@googleapis/drive", () => ({ drive: googleDriveModuleMock.drive }));
 
 const fixtureInputPath = "tests/fixtures/golden/publish/basic-note/input.md";
 const fixtureExpectedDocumentXmlPath =
@@ -1236,6 +1257,607 @@ describe("SharePoint transport", () => {
   });
 });
 
+describe("Google Drive transport", () => {
+  it("creates a converted Google Doc from DOCX bytes when no file ID is known", async () => {
+    const harness = createGoogleDriveHarness({
+      file: {
+        id: "file-1",
+        name: "Quarterly Plan",
+        mimeType: GOOGLE_DOC_MIME_TYPE,
+        webViewLink: "https://docs.google.com/document/d/file-1/edit",
+      },
+    });
+    const transport = new GoogleDriveTransport({ driveClient: harness.client });
+
+    const result = await transport.upload("Quarterly Plan.docx", new Uint8Array([1, 2, 3]));
+
+    expect(result).toEqual({
+      kind: "google-drive",
+      destinationId: "file-1",
+      fileId: "file-1",
+      name: "Quarterly Plan",
+      mimeType: GOOGLE_DOC_MIME_TYPE,
+      webViewLink: "https://docs.google.com/document/d/file-1/edit",
+    });
+    expect(harness.update).not.toHaveBeenCalled();
+    expect(harness.calls).toEqual([
+      {
+        operation: "create",
+        fileId: undefined,
+        name: "Quarterly Plan",
+        requestMimeType: GOOGLE_DOC_MIME_TYPE,
+        mediaMimeType: DOCX_MIME_TYPE,
+        parents: undefined,
+        parameterKeys: ["fields", "media", "requestBody", "supportsAllDrives"],
+        requestBodyKeys: ["mimeType", "name"],
+        body: [1, 2, 3],
+        fields: "id,name,mimeType,webViewLink",
+        supportsAllDrives: true,
+      },
+    ]);
+  });
+
+  it("omits optional destination fields Drive did not return", async () => {
+    const harness = createGoogleDriveHarness({ file: { id: "file-bare" } });
+    const transport = new GoogleDriveTransport({ driveClient: harness.client });
+
+    await expect(transport.upload("Bare", new Uint8Array([1]))).resolves.toEqual({
+      kind: "google-drive",
+      destinationId: "file-bare",
+      fileId: "file-bare",
+      name: "Bare",
+    });
+  });
+
+  it("updates the existing Doc when resolveExistingFileId yields a stored file ID", async () => {
+    const harness = createGoogleDriveHarness({ file: { id: "file-existing", name: "Handbook" } });
+    const seenIds: string[] = [];
+    const transport = new GoogleDriveTransport({
+      driveClient: harness.client,
+      resolveExistingFileId: async (canonicalId) => {
+        seenIds.push(canonicalId);
+        return "file-existing";
+      },
+    });
+
+    const result = await transport.upload("Handbook", new Uint8Array([4, 5]));
+
+    expect(seenIds).toEqual(["Handbook"]);
+    expect(harness.create).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      kind: "google-drive",
+      destinationId: "file-existing",
+      fileId: "file-existing",
+    });
+    expect(harness.calls).toEqual([
+      {
+        operation: "update",
+        fileId: "file-existing",
+        name: "Handbook",
+        requestMimeType: GOOGLE_DOC_MIME_TYPE,
+        mediaMimeType: DOCX_MIME_TYPE,
+        parents: undefined,
+        parameterKeys: ["fields", "fileId", "media", "requestBody", "supportsAllDrives"],
+        requestBodyKeys: ["mimeType", "name"],
+        body: [4, 5],
+        fields: "id,name,mimeType,webViewLink",
+        supportsAllDrives: true,
+      },
+    ]);
+  });
+
+  it("creates new Docs inside folderId but never re-parents an existing Doc", async () => {
+    const harness = createGoogleDriveHarness();
+    const created = new GoogleDriveTransport({
+      driveClient: harness.client,
+      folderId: "folder-1",
+    });
+    const updated = new GoogleDriveTransport({
+      driveClient: harness.client,
+      folderId: "folder-1",
+      resolveExistingFileId: () => "file-existing",
+    });
+
+    await created.upload("New Doc", new Uint8Array([1]));
+    await updated.upload("Existing Doc", new Uint8Array([2]));
+
+    expect(harness.calls[0]).toMatchObject({
+      operation: "create",
+      parents: ["folder-1"],
+      requestBodyKeys: ["mimeType", "name", "parents"],
+    });
+    expect(harness.calls[1]).toMatchObject({
+      operation: "update",
+      fileId: "file-existing",
+      parents: undefined,
+      parameterKeys: ["fields", "fileId", "media", "requestBody", "supportsAllDrives"],
+      requestBodyKeys: ["mimeType", "name"],
+    });
+    expect(harness.calls[1]?.parameterKeys).not.toContain("addParents");
+  });
+
+  it("names no Drive scope other than drive.file anywhere in the module source", async () => {
+    const googleSourcePath = fileURLToPath(new URL("../src/google.ts", import.meta.url));
+    const googleSource = await readFile(googleSourcePath, "utf8");
+    const namedScopes = googleSource.match(/https:\/\/www\.googleapis\.com\/auth\/[\w.]+/g) ?? [];
+
+    expect(GOOGLE_DRIVE_FILE_SCOPE).toBe("https://www.googleapis.com/auth/drive.file");
+    expect(namedScopes.length).toBeGreaterThan(0);
+    expect([...new Set(namedScopes)]).toEqual([GOOGLE_DRIVE_FILE_SCOPE]);
+  });
+
+  it("exposes no credentials and sends no auth material in Drive requests", async () => {
+    const harness = createGoogleDriveHarness();
+    const transport = new GoogleDriveTransport({
+      driveClient: harness.client,
+      folderId: "folder-1",
+    });
+
+    await transport.upload("No Secrets", new Uint8Array([1]));
+
+    // The transport does retain the consumer's auth client, but every internal
+    // field is a `#private`, so the only own property it can expose is the
+    // folder ID the consumer already gave it.
+    expect(Object.keys(transport)).toEqual(["folderId"]);
+    expect(JSON.stringify(transport)).toBe('{"folderId":"folder-1"}');
+
+    const params = harness.create.mock.calls[0]?.[0];
+
+    expect(Object.keys(params ?? {}).sort()).toEqual([
+      "fields",
+      "media",
+      "requestBody",
+      "supportsAllDrives",
+    ]);
+    expect(params).not.toHaveProperty("auth");
+    expect(params).not.toHaveProperty("headers");
+    expect(params).not.toHaveProperty("oauth_token");
+  });
+
+  it("strips a trailing .docx extension from the default Google Doc name", async () => {
+    const harness = createGoogleDriveHarness();
+    const transport = new GoogleDriveTransport({ driveClient: harness.client });
+
+    await transport.upload("Release Notes.DOCX", new Uint8Array([1]));
+
+    expect(defaultGoogleDocName("Release Notes.docx")).toBe("Release Notes");
+    expect(defaultGoogleDocName("Release Notes.DOCX")).toBe("Release Notes");
+    expect(defaultGoogleDocName("docx-primer")).toBe("docx-primer");
+    expect(harness.calls[0]?.name).toBe("Release Notes");
+  });
+
+  it("maps opaque canonical IDs to Drive names through mapCanonicalId", async () => {
+    const harness = createGoogleDriveHarness();
+    const seenIds: string[] = [];
+    const transport = new GoogleDriveTransport({
+      driveClient: harness.client,
+      mapCanonicalId: (canonicalId) => {
+        seenIds.push(canonicalId);
+        return "TeamWiki Note 123";
+      },
+    });
+
+    await transport.upload("urn:teamwiki:note:123", new Uint8Array([1]));
+
+    expect(seenIds).toEqual(["urn:teamwiki:note:123"]);
+    expect(harness.calls[0]?.name).toBe("TeamWiki Note 123");
+  });
+
+  it("snapshots DOCX bytes before asynchronous Drive work", async () => {
+    const harness = createGoogleDriveHarness();
+    const transport = new GoogleDriveTransport({
+      driveClient: harness.client,
+      resolveExistingFileId: async () => undefined,
+    });
+    const docx = new Uint8Array([1, 2, 3]);
+
+    const upload = transport.upload("Snapshot", docx);
+    docx.fill(9);
+    await upload;
+
+    expect(harness.calls[0]?.body).toEqual([1, 2, 3]);
+  });
+
+  it.each([
+    [
+      "both auth and driveClient",
+      (client: GoogleDriveFilesClient) =>
+        ({
+          auth: new OAuth2Client({ clientId: "client-id" }),
+          driveClient: client,
+        }) as unknown as GoogleDriveTransportOptions,
+    ],
+    ["neither auth nor driveClient", () => ({}) as unknown as GoogleDriveTransportOptions],
+    [
+      "blank folder ID",
+      (client: GoogleDriveFilesClient) =>
+        ({ driveClient: client, folderId: " " }) as GoogleDriveTransportOptions,
+    ],
+    [
+      "folder ID with a path separator",
+      (client: GoogleDriveFilesClient) =>
+        ({ driveClient: client, folderId: "folder/child" }) as GoogleDriveTransportOptions,
+    ],
+  ])("rejects invalid config: %s", (_label, buildOptions) => {
+    expect(() => new GoogleDriveTransport(buildOptions(createGoogleDriveHarness().client))).toThrow(
+      expect.objectContaining({
+        name: "GoogleDriveTransportError",
+        code: "GOOGLE_DRIVE_CONFIG_INVALID",
+      }),
+    );
+  });
+
+  it.each(["", "  ", " leading", "trailing ", "bad\0id"])(
+    "rejects invalid canonical ID %j",
+    async (canonicalId) => {
+      const harness = createGoogleDriveHarness();
+      const transport = new GoogleDriveTransport({ driveClient: harness.client });
+
+      await expect(transport.upload(canonicalId, new Uint8Array([1]))).rejects.toMatchObject({
+        name: "GoogleDriveTransportError",
+        code: "GOOGLE_DRIVE_NAME_INVALID",
+      });
+      expect(harness.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    "teamwiki/basic-note",
+    " leading",
+    "trailing ",
+    "control\u001Fname",
+    "\u007Fdelete",
+    "",
+    "a".repeat(256),
+  ])("rejects unsafe mapped Google Doc name %j", async (mappedName) => {
+    const harness = createGoogleDriveHarness();
+    const transport = new GoogleDriveTransport({
+      driveClient: harness.client,
+      mapCanonicalId: () => mappedName,
+    });
+
+    await expect(transport.upload("safe", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "GoogleDriveTransportError",
+      code: "GOOGLE_DRIVE_NAME_INVALID",
+      guidance: expect.stringContaining("mapCanonicalId"),
+    });
+    expect(harness.create).not.toHaveBeenCalled();
+  });
+
+  it("wraps mapper failures with an actionable typed error and original cause", async () => {
+    const cause = new Error("mapper exploded");
+    const harness = createGoogleDriveHarness();
+    const transport = new GoogleDriveTransport({
+      driveClient: harness.client,
+      mapCanonicalId: () => {
+        throw cause;
+      },
+    });
+
+    await expect(transport.upload("opaque:id", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "GoogleDriveTransportError",
+      code: "GOOGLE_DRIVE_NAME_INVALID",
+      guidance: expect.stringContaining("mapCanonicalId"),
+      cause,
+    });
+    expect(harness.create).not.toHaveBeenCalled();
+  });
+
+  it("wraps resolveExistingFileId failures and rejects unusable resolved IDs", async () => {
+    const cause = new Error("manifest unavailable");
+    const throwingHarness = createGoogleDriveHarness();
+    const throwingTransport = new GoogleDriveTransport({
+      driveClient: throwingHarness.client,
+      resolveExistingFileId: () => {
+        throw cause;
+      },
+    });
+    const invalidHarness = createGoogleDriveHarness();
+    const invalidTransport = new GoogleDriveTransport({
+      driveClient: invalidHarness.client,
+      resolveExistingFileId: () => " ",
+    });
+
+    await expect(throwingTransport.upload("doc", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "GoogleDriveTransportError",
+      code: "GOOGLE_DRIVE_CONFIG_INVALID",
+      guidance: expect.stringContaining("resolveExistingFileId"),
+      cause,
+    });
+    await expect(invalidTransport.upload("doc", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "GoogleDriveTransportError",
+      code: "GOOGLE_DRIVE_CONFIG_INVALID",
+    });
+    expect(throwingHarness.create).not.toHaveBeenCalled();
+    expect(invalidHarness.create).not.toHaveBeenCalled();
+    expect(invalidHarness.update).not.toHaveBeenCalled();
+  });
+
+  it("enforces the 50 MB Google Docs import cap before any Drive call", async () => {
+    const harness = createGoogleDriveHarness();
+    const transport = new GoogleDriveTransport({ driveClient: harness.client });
+    const tooLarge = { byteLength: GOOGLE_DRIVE_DOCX_IMPORT_MAX_BYTES + 1 } as Uint8Array;
+
+    await expect(transport.upload("too-large", tooLarge)).rejects.toMatchObject({
+      name: "GoogleDriveTransportError",
+      code: "GOOGLE_DRIVE_DOCX_TOO_LARGE",
+    });
+    expect(harness.create).not.toHaveBeenCalled();
+    expect(harness.update).not.toHaveBeenCalled();
+  });
+
+  it("maps Drive API rejections to bounded context without leaking tokens", async () => {
+    const harness = createGoogleDriveHarness({
+      createError: Object.assign(new Error("ya29.secret-access-token was rejected"), {
+        status: 403,
+        response: {
+          status: 403,
+          data: {
+            error: {
+              code: 403,
+              message: "ya29.secret-access-token was rejected",
+              errors: [{ domain: "global", reason: "storageQuota\nExceeded\u007F" }],
+            },
+          },
+        },
+      }),
+    });
+    const transport = new GoogleDriveTransport({ driveClient: harness.client });
+
+    await expect(transport.upload("denied", new Uint8Array([1]))).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof GoogleDriveTransportError &&
+        error.code === "GOOGLE_DRIVE_API_FAILED" &&
+        error.context?.status === 403 &&
+        error.context.reason === "storageQuotaExceeded" &&
+        error.cause === undefined &&
+        !String(error).includes("ya29.secret-access-token") &&
+        !String(error).includes("\n") &&
+        !String(error).includes("\u007F"),
+    );
+  });
+
+  it("maps a 403 with an insufficient-permission reason to an auth failure", async () => {
+    const harness = createGoogleDriveHarness({
+      createError: Object.assign(new Error("Insufficient permissions"), {
+        status: 403,
+        response: {
+          status: 403,
+          data: {
+            error: {
+              code: 403,
+              errors: [{ domain: "global", reason: "insufficientFilePermissions" }],
+            },
+          },
+        },
+      }),
+    });
+    const transport = new GoogleDriveTransport({ driveClient: harness.client });
+
+    await expect(transport.upload("no-scope", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "GoogleDriveTransportError",
+      code: "GOOGLE_DRIVE_AUTH_FAILED",
+      guidance: expect.stringContaining(GOOGLE_DRIVE_FILE_SCOPE),
+      context: { status: 403, reason: "insufficientFilePermissions" },
+    });
+  });
+
+  it("distinguishes an unreachable Drive API from a Drive API decision", async () => {
+    const networkHarness = createGoogleDriveHarness({
+      createError: Object.assign(new Error("getaddrinfo ENOTFOUND www.googleapis.com"), {
+        code: "ENOTFOUND",
+      }),
+    });
+    // A non-Error rejection carries no status either, so it must not be
+    // reported as a terminal Drive decision.
+    const opaqueHarness = createGoogleDriveHarness({ createError: "boom" });
+    const networkTransport = new GoogleDriveTransport({ driveClient: networkHarness.client });
+    const opaqueTransport = new GoogleDriveTransport({ driveClient: opaqueHarness.client });
+
+    await expect(networkTransport.upload("offline", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "GoogleDriveTransportError",
+      code: "GOOGLE_DRIVE_NETWORK_FAILED",
+      context: {},
+    });
+    await expect(opaqueTransport.upload("opaque", new Uint8Array([1]))).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof GoogleDriveTransportError &&
+        error.code === "GOOGLE_DRIVE_NETWORK_FAILED" &&
+        error.cause === undefined &&
+        JSON.stringify(error.context) === "{}",
+    );
+  });
+
+  it("leaves context undefined on validation errors that never reached Drive", async () => {
+    const harness = createGoogleDriveHarness();
+    const transport = new GoogleDriveTransport({ driveClient: harness.client });
+
+    await expect(transport.upload("bad/name", new Uint8Array([1]))).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof GoogleDriveTransportError &&
+        error.code === "GOOGLE_DRIVE_NAME_INVALID" &&
+        error.context === undefined,
+    );
+  });
+
+  it("rejects a Drive response whose stored file is not a Google Doc", async () => {
+    const harness = createGoogleDriveHarness({
+      file: { id: "file-blob", name: "Handbook", mimeType: DOCX_MIME_TYPE },
+    });
+    const transport = new GoogleDriveTransport({
+      driveClient: harness.client,
+      resolveExistingFileId: () => "file-blob",
+    });
+
+    await expect(transport.upload("Handbook", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "GoogleDriveTransportError",
+      code: "GOOGLE_DRIVE_RESPONSE_INVALID",
+      message: expect.stringContaining("file-blob"),
+      guidance: expect.stringContaining("file-blob"),
+      context: { fileId: "file-blob" },
+    });
+  });
+
+  it("propagates a 404 from files.update without silently creating a duplicate", async () => {
+    const harness = createGoogleDriveHarness({
+      updateError: Object.assign(new Error("File not found: file-gone."), {
+        status: 404,
+        response: {
+          status: 404,
+          data: { error: { code: 404, errors: [{ domain: "global", reason: "notFound" }] } },
+        },
+      }),
+    });
+    const transport = new GoogleDriveTransport({
+      driveClient: harness.client,
+      resolveExistingFileId: () => "file-gone",
+    });
+
+    await expect(transport.upload("Vanished", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "GoogleDriveTransportError",
+      code: "GOOGLE_DRIVE_API_FAILED",
+      context: { status: 404, reason: "notFound" },
+    });
+    expect(harness.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects a mapCanonicalId that does not return a string", async () => {
+    const harness = createGoogleDriveHarness();
+    const transport = new GoogleDriveTransport({
+      driveClient: harness.client,
+      mapCanonicalId: () => 42 as unknown as string,
+    });
+
+    await expect(transport.upload("doc", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "GoogleDriveTransportError",
+      code: "GOOGLE_DRIVE_NAME_INVALID",
+      cause: expect.objectContaining({ name: "TypeError" }),
+    });
+    expect(harness.create).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["null, the natural miss for a Map-style manifest", null],
+    ["a number", 42],
+    ["an object", {}],
+    ["a Drive ID with a slash", "folder/file"],
+  ])("rejects resolveExistingFileId returning %s", async (_label, resolved) => {
+    const harness = createGoogleDriveHarness();
+    const transport = new GoogleDriveTransport({
+      driveClient: harness.client,
+      resolveExistingFileId: () => resolved as unknown as string | undefined,
+    });
+
+    await expect(transport.upload("doc", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "GoogleDriveTransportError",
+      code: "GOOGLE_DRIVE_CONFIG_INVALID",
+      guidance: expect.stringContaining("resolveExistingFileId"),
+    });
+    expect(harness.create).not.toHaveBeenCalled();
+    expect(harness.update).not.toHaveBeenCalled();
+  });
+
+  it("blames the default mapper only when the default mapper produced the bad name", async () => {
+    const harness = createGoogleDriveHarness();
+    const defaultMapped = new GoogleDriveTransport({ driveClient: harness.client });
+    const customMapped = new GoogleDriveTransport({
+      driveClient: harness.client,
+      mapCanonicalId: (canonicalId) => canonicalId,
+    });
+
+    await expect(defaultMapped.upload("teamwiki/note", new Uint8Array([1]))).rejects.toMatchObject({
+      code: "GOOGLE_DRIVE_NAME_INVALID",
+      message: expect.stringContaining("default-mapped"),
+      guidance: expect.stringContaining("pass mapCanonicalId"),
+    });
+    await expect(customMapped.upload("teamwiki/note", new Uint8Array([1]))).rejects.toMatchObject({
+      code: "GOOGLE_DRIVE_NAME_INVALID",
+      guidance: expect.stringContaining("Return a single trimmed Drive document name"),
+    });
+  });
+
+  it("builds the lazily imported Drive client once for concurrent uploads", async () => {
+    const files = createStubDriveFiles();
+    googleDriveModuleMock.drive.mockReset();
+    googleDriveModuleMock.drive.mockReturnValue({ files });
+    const auth = new OAuth2Client({ clientId: "client-id" });
+    const transport = new GoogleDriveTransport({ auth });
+
+    const [first, second] = await Promise.all([
+      transport.upload("A", new Uint8Array([1])),
+      transport.upload("B", new Uint8Array([2])),
+    ]);
+
+    expect(googleDriveModuleMock.drive).toHaveBeenCalledTimes(1);
+    expect(googleDriveModuleMock.drive).toHaveBeenCalledWith({ version: "v3", auth });
+    expect(files.create).toHaveBeenCalledTimes(2);
+    expect(first?.fileId).toBe("file-1");
+    expect(second?.fileId).toBe("file-1");
+  });
+
+  it("does not memoize a failed Drive client construction", async () => {
+    const failure = new Error("Drive client construction failed");
+    const files = createStubDriveFiles();
+    googleDriveModuleMock.drive.mockReset();
+    googleDriveModuleMock.drive
+      .mockImplementationOnce(() => {
+        throw failure;
+      })
+      .mockImplementation(() => ({ files }));
+    const transport = new GoogleDriveTransport({
+      auth: new OAuth2Client({ clientId: "client-id" }),
+    });
+
+    await expect(transport.upload("Retry", new Uint8Array([1]))).rejects.toBe(failure);
+    expect(files.create).not.toHaveBeenCalled();
+
+    // The first attempt must not be cached, so this retries the import.
+    await expect(transport.upload("Retry", new Uint8Array([1]))).resolves.toMatchObject({
+      kind: "google-drive",
+      fileId: "file-1",
+    });
+    expect(googleDriveModuleMock.drive).toHaveBeenCalledTimes(2);
+  });
+
+  it("maps Drive 401 responses to an auth failure", async () => {
+    const harness = createGoogleDriveHarness({
+      file: { id: "file-1" },
+      updateError: Object.assign(new Error("Invalid Credentials"), {
+        status: 401,
+        response: {
+          status: 401,
+          data: { error: { code: 401, status: "UNAUTHENTICATED" } },
+        },
+      }),
+    });
+    const transport = new GoogleDriveTransport({
+      driveClient: harness.client,
+      resolveExistingFileId: () => "file-1",
+    });
+
+    await expect(transport.upload("stale-token", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "GoogleDriveTransportError",
+      code: "GOOGLE_DRIVE_AUTH_FAILED",
+      guidance: expect.stringContaining(GOOGLE_DRIVE_FILE_SCOPE),
+      context: { status: 401, reason: "UNAUTHENTICATED" },
+    });
+  });
+
+  it.each([
+    ["missing data", null],
+    ["missing id", { name: "no id here" }],
+    ["blank id", { id: " " }],
+  ])("fails closed on an invalid Drive response: %s", async (_label, file) => {
+    const harness = createGoogleDriveHarness({ file });
+    const transport = new GoogleDriveTransport({ driveClient: harness.client });
+
+    await expect(transport.upload("bad-response", new Uint8Array([1]))).rejects.toMatchObject({
+      name: "GoogleDriveTransportError",
+      code: "GOOGLE_DRIVE_RESPONSE_INVALID",
+    });
+  });
+});
+
 async function createTempDocx(name: string): Promise<string> {
   const tempDirectory = await createTempDirectory();
   const docxPath = join(tempDirectory, name);
@@ -1323,6 +1945,89 @@ function createSuccessfulSharePointFetch(
     }
 
     return Response.json(responseBody, { status: 201 });
+  };
+}
+
+interface GoogleDriveCall {
+  readonly operation: "create" | "update";
+  readonly fileId: string | undefined;
+  readonly name: string;
+  readonly requestMimeType: string;
+  readonly mediaMimeType: string;
+  readonly parents: readonly string[] | undefined;
+  readonly parameterKeys: readonly string[];
+  readonly requestBodyKeys: readonly string[];
+  readonly body: readonly number[];
+  readonly fields: string;
+  readonly supportsAllDrives: boolean;
+}
+
+function createGoogleDriveHarness(
+  options: {
+    readonly file?: GoogleDriveFileMetadata | null;
+    readonly createError?: unknown;
+    readonly updateError?: unknown;
+  } = {},
+) {
+  const calls: GoogleDriveCall[] = [];
+  const file = "file" in options ? options.file : { id: "file-1" };
+  const respond = async (
+    operation: "create" | "update",
+    params: GoogleDriveCreateFileParams | GoogleDriveUpdateFileParams,
+    error: unknown,
+  ): Promise<GoogleDriveFileResponse> => {
+    calls.push(await recordGoogleDriveCall(operation, params));
+
+    if (error !== undefined) {
+      throw error;
+    }
+
+    return { data: file };
+  };
+  const create = vi.fn(async (params: GoogleDriveCreateFileParams) =>
+    respond("create", params, options.createError),
+  );
+  const update = vi.fn(async (params: GoogleDriveUpdateFileParams) =>
+    respond("update", params, options.updateError),
+  );
+  const client: GoogleDriveFilesClient = { files: { create, update } };
+
+  return { calls, client, create, update };
+}
+
+function createStubDriveFiles() {
+  const response: GoogleDriveFileResponse = {
+    data: { id: "file-1", name: "Stub", mimeType: GOOGLE_DOC_MIME_TYPE },
+  };
+
+  return {
+    create: vi.fn(async (_params: GoogleDriveCreateFileParams) => response),
+    update: vi.fn(async (_params: GoogleDriveUpdateFileParams) => response),
+  };
+}
+
+async function recordGoogleDriveCall(
+  operation: "create" | "update",
+  params: GoogleDriveCreateFileParams | GoogleDriveUpdateFileParams,
+): Promise<GoogleDriveCall> {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of params.media.body) {
+    chunks.push(Buffer.from(chunk as Uint8Array));
+  }
+
+  return {
+    operation,
+    fileId: "fileId" in params ? params.fileId : undefined,
+    name: params.requestBody.name,
+    requestMimeType: params.requestBody.mimeType,
+    mediaMimeType: params.media.mimeType,
+    parents: "parents" in params.requestBody ? params.requestBody.parents : undefined,
+    parameterKeys: Object.keys(params).sort(),
+    requestBodyKeys: Object.keys(params.requestBody).sort(),
+    body: [...Buffer.concat(chunks)],
+    fields: params.fields,
+    supportsAllDrives: params.supportsAllDrives,
   };
 }
 

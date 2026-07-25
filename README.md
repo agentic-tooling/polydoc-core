@@ -198,6 +198,147 @@ Microsoft references:
 - [DriveItem simple upload](https://learn.microsoft.com/en-us/graph/api/driveitem-put-content?view=graph-rest-1.0)
 - [OneDrive/SharePoint path addressing](https://learn.microsoft.com/en-us/graph/onedrive-addressing-driveitems)
 
+### Google Drive Transport
+
+`GoogleDriveTransport` publishes DOCX bytes to Google Drive as a converted
+Google Doc. It implements the same `Transport.upload(canonicalId, docx)`
+contract as the other transports.
+
+```ts
+import { OAuth2Client } from "google-auth-library";
+import {
+  GOOGLE_DRIVE_FILE_SCOPE,
+  GoogleDriveTransport,
+  convertMarkdownToDocx,
+} from "@agentic-tooling/polydoc-core";
+
+const docx = await convertMarkdownToDocx({
+  markdown,
+  referenceDocxPath: "./reference.docx",
+});
+
+// The consuming application owns the OAuth flow and the resulting tokens.
+const auth = new OAuth2Client({ clientId, clientSecret, redirectUri });
+auth.setCredentials({ refresh_token: refreshTokenFromYourOwnStore });
+
+const transport = new GoogleDriveTransport({
+  auth,
+  folderId: "drive-folder-id",
+  mapCanonicalId: (canonicalId) => `TeamWiki — ${canonicalId}`,
+  resolveExistingFileId: (canonicalId) => manifest.get(canonicalId)?.fileId,
+});
+
+const destination = await transport.upload("handbook-intro", docx);
+
+console.log(GOOGLE_DRIVE_FILE_SCOPE); // https://www.googleapis.com/auth/drive.file
+console.log(destination.destinationId); // Drive file ID
+console.log(destination.fileId); // same ID, for Drive consumers
+console.log(destination.webViewLink); // optional Drive webViewLink
+```
+
+Auth uses `google-auth-library` through `@googleapis/drive`. The required scope
+is `drive.file`, exported as `GOOGLE_DRIVE_FILE_SCOPE`, which is the
+least-privilege Drive scope: the application may only see and manage files it
+created itself. This package requests no broader Drive scope.
+
+`google-auth-library` is an optional peer dependency. It is only needed if you
+construct an auth client and pass `auth`; consumers that inject `driveClient`
+directly, or that use another transport, do not need it installed.
+
+**Token handling is left to the consumer.** The library takes an already
+authorized auth client and does nothing else with it. It does not run an OAuth
+loopback server, does not open a browser, does not read environment variables,
+does not persist tokens to disk, and does not touch a keychain. It never
+performs a token refresh itself and never writes tokens anywhere; the auth
+client you supply does its own in-memory refresh during a request, exactly as it
+would outside this library. Persisting the resulting refresh token, if you want
+one, is your responsibility. Consumers that use a service account, workload
+identity federation, or their own token cache can pass any auth client the Drive
+v3 client accepts.
+
+The `@googleapis/drive` SDK is imported lazily on the first upload, so consumers
+that only use another transport never pay to load it.
+
+Uploads use the Drive v3 files resource:
+
+```txt
+POST /drive/v3/files          (new document)
+PATCH /drive/v3/files/{fileId} (existing document)
+```
+
+Both calls send the DOCX bytes as the media body with DOCX content type, and set
+`mimeType: application/vnd.google-apps.document` on the file metadata so Drive
+converts the upload into a native Google Doc on import. The Doc MIME type is
+exported as `GOOGLE_DOC_MIME_TYPE`.
+
+The response must include a non-empty Drive file `id`, and any `mimeType` Drive
+reports back must be the Google Doc type; otherwise the upload fails closed
+rather than returning a partial destination. That second check catches the case
+where the conversion did not happen and the DOCX was stored as an opaque blob —
+usually a `resolveExistingFileId` pointing at a plain DOCX upload, where every
+subsequent publish would silently write a file nobody can open as a Doc. The
+offending Drive file ID is included in both the message and the error `context`
+so it can be deleted or adopted.
+
+Drive has no path namespace, so `mapCanonicalId` returns a **document name**,
+not a path. The default mapper uses the canonical ID verbatim except that a
+trailing `.docx` extension is stripped, because a converted Google Doc should
+not be named `foo.docx`. Names must be a single trimmed segment: slashes,
+control characters, NUL bytes, and names over 255 characters are rejected before
+any Drive call. A canonical ID that looks like a path, such as
+`teamwiki/basic-note`, therefore needs an explicit `mapCanonicalId`.
+
+Drive addresses documents by opaque file ID rather than by path, so this package
+cannot rediscover a previously published document on its own and deliberately
+keeps no local state. `resolveExistingFileId` is the create-or-update hook: the
+consumer owns the manifest that records `fileId` per canonical ID. When it
+resolves to an ID, the transport calls `files.update` on that file; otherwise it
+calls `files.create` and returns the new ID for the consumer to persist.
+
+`folderId` is applied as `parents` on create only. Drive rejects `parents` on
+update, and re-parenting an already published document would be a surprising
+side effect, so updates leave the document where it is.
+
+Two consequences of the `drive.file` scope are worth knowing before they show up
+as confusing production errors:
+
+- **The OAuth client can only see files it created.** A `folderId` for a folder
+  created by hand in the Drive web UI returns `404 File not found`, because that
+  folder is invisible to this client. The folder must have been created by this
+  same OAuth client, or selected by the user through the Google Picker, which
+  grants per-file access. The same applies to any ID returned from
+  `resolveExistingFileId` that was created by a different client.
+- **Service accounts have no Drive storage quota.** When authenticating as a
+  service account, always set `folderId` to a folder on a shared drive, or to a
+  folder that has been shared with the service account. An unparented create
+  fails with `storageQuotaExceeded`, because the file would otherwise land in a
+  personal Drive the service account does not have.
+
+Google Drive converts a text document into Google Docs format only up to 50 MB,
+exported as `GOOGLE_DRIVE_DOCX_IMPORT_MAX_BYTES`. `GoogleDriveTransport` checks
+this limit before any Drive call.
+
+Failures throw `GoogleDriveTransportError` with a stable `code`, actionable
+`guidance`, and a bounded `context` carrying the HTTP status and the Drive error
+reason. Raw Drive error objects and response bodies are never included, so
+tokens cannot leak through an error message. A request that never reached the
+Drive API, and so carries no HTTP status, is reported as
+`GOOGLE_DRIVE_NETWORK_FAILED` rather than `GOOGLE_DRIVE_API_FAILED`, so callers
+can tell a retryable transport failure from a decision by Drive. A `401`, and a
+`403` whose Drive reason indicates insufficient permissions, map to
+`GOOGLE_DRIVE_AUTH_FAILED`.
+
+Google publishing is one-way: this package does not import, diff, or
+reverse-convert Google Docs.
+
+Google references:
+
+- [Drive `drive.file` scope](https://developers.google.com/workspace/drive/api/guides/api-specific-auth)
+- [Upload file data](https://developers.google.com/workspace/drive/api/guides/manage-uploads)
+- [`files.create`](https://developers.google.com/workspace/drive/api/reference/rest/v3/files/create)
+- [`files.update`](https://developers.google.com/workspace/drive/api/reference/rest/v3/files/update)
+- [Files you can store in Google Drive](https://support.google.com/drive/answer/37603)
+
 ## Pandoc Contract
 
 This package shells out to the system `pandoc` binary through `execa` with an
