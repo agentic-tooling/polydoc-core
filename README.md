@@ -9,7 +9,9 @@ taking on a CLI.
 The original Polydoc design work scoped a local-first Markdown-to-Word and
 Markdown-to-Google Docs workflow. This package keeps only the reusable library
 boundary from that work. CLI commands, project manifests, watch mode, OAuth user
-experience, transports, and sidecar storage stay outside this repository.
+experience, remote service integrations, and sidecar storage stay outside this
+repository. The library does include the shared transport contract and a local
+file transport for consumers that need deterministic DOCX writes.
 
 ## API
 
@@ -44,6 +46,53 @@ console.log(SUPPORTED_PANDOC_MAJOR); // 3
 `convertMarkdownToDocx()` returns DOCX bytes as a `Uint8Array`. Callers can then
 write those bytes to disk, upload them to a transport, or pass them to another
 library.
+
+## Transports
+
+Transports are side-effecting adapters that publish DOCX bytes for a canonical
+document ID and return a stable destination handle for later consumers.
+
+```ts
+import {
+  LocalFileTransport,
+  convertMarkdownToDocx,
+} from "@agentic-tooling/polydoc-core";
+
+const docx = await convertMarkdownToDocx({
+  markdown,
+  referenceDocxPath: "./reference.docx",
+});
+
+const transport = new LocalFileTransport({ rootDir: "./generated-docx" });
+const destination = await transport.upload("teamwiki/basic-note", docx);
+
+console.log(destination.destinationId); // absolute path to generated-docx/teamwiki/basic-note.docx
+console.log(destination.path); // same path, for local-file consumers
+```
+
+`LocalFileTransport` writes or overwrites one deterministic `.docx` destination
+per canonical ID, creating parent directories as needed. By default,
+`teamwiki/basic-note` maps to `<rootDir>/teamwiki/basic-note.docx`. A custom
+`mapCanonicalId` option can map opaque IDs, such as `urn:teamwiki:note:123`, to
+a relative destination under the same root.
+
+The local file transport validates paths lexically before writing:
+
+- Canonical IDs must be non-empty trimmed identifiers and must not contain NUL
+  bytes.
+- Mapped destinations must be non-empty relative paths.
+- Parent-directory segments, absolute paths, Windows drive syntax, backslashes,
+  colons, Windows-invalid filename characters, control characters, empty path
+  segments, Windows-reserved device names, path segments ending in dot or space,
+  and NUL bytes are rejected in mapped destinations.
+- The resolved destination must stay under the configured `rootDir`.
+
+This boundary check prevents accidental lexical path escape. It does not resolve
+symlinks or claim protection against a writable root that already contains
+hostile symlinks.
+
+Transport failures throw `TransportError` with a stable `code`, actionable
+`guidance`, and the original `cause` when filesystem or mapper operations fail.
 
 ## Pandoc Contract
 
@@ -103,7 +152,7 @@ Pandoc binary/version are expected to produce identical bytes.
 ## Requirements
 
 - Node.js 20 or newer
-- pnpm 11.9.0
+- pnpm 10.34.5
 - Pandoc 3.x for conversion
 
 ## Development
@@ -130,7 +179,14 @@ pnpm format:check
 ```
 
 Pandoc integration tests are included in `pnpm test`. They skip cleanly when a
-supported Pandoc binary is unavailable.
+supported Pandoc binary is unavailable. CI has a dedicated Pandoc-backed job
+that installs Pandoc 3.10.1 and requires the integration path to be available,
+while the regular Node matrix can still run without Pandoc.
+
+GitHub Actions runs blocking checks for pushes to `main` and pull requests:
+format check, lint, typecheck, tests, and build across supported Node majors
+20.x, 22.x, and 24.x. Dependency installation uses the checked-in lockfile with
+`pnpm install --frozen-lockfile`.
 
 Format files:
 
