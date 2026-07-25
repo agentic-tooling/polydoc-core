@@ -1,0 +1,39 @@
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local environment and OS files
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# Local working material
+/_/
+
+# Local AI tooling
+/.agents/
+/.claude/
+/.codex/
+/.cursor*
+/.aider*
+/.windsurf*
+/.continue/
+/.codeium/
+/.roo/
+/.cline/
+/.gemini/
+/.opencode/
+/.antigravitycli/
+
+# Local AI context files
+/AGENTS.md
+/CLAUDE.md
+/CLAUDE.local.md
+/CODEX.md
+/GEMINI.md
+/CONTEXT.md
+/context.md
+/.github/copilot-instructions.md

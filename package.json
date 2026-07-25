@@ -1,0 +1,58 @@
+{
+  "name": "@agentic-tooling/polydoc-core",
+  "version": "0.0.0",
+  "description": "Reusable TypeScript conversion core and pluggable transports for polydoc and TeamWiki.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Logan Lindquist Land",
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentic-tooling/polydoc-core.git"
+  },
+  "bugs": {
+    "url": "https://github.com/agentic-tooling/polydoc-core/issues"
+  },
+  "homepage": "https://github.com/agentic-tooling/polydoc-core#readme",
+  "keywords": [
+    "markdown",
+    "docx",
+    "polydoc",
+    "teamwiki",
+    "conversion"
+  ],
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
+    "prepack": "pnpm build"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.5",
+    "@types/node": "^26.1.1",
+    "@vitest/coverage-v8": "^4.1.10",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
