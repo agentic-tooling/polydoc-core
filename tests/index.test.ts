@@ -2,18 +2,29 @@ import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { strFromU8, unzipSync } from "fflate";
+import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 import { OAuth2Client } from "google-auth-library";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   applyMarkdownPostprocessors,
   applyMarkdownPreprocessors,
+  buildDocxImportReport,
   type ConvertMarkdownToDocxOptions,
+  convertDocxToMarkdown,
   convertMarkdownToDocx,
   createSharePointClientSecretAccessTokenProvider,
+  DEFAULT_DOCX_TRACK_CHANGES,
   DEFAULT_SOURCE_DATE_EPOCH,
+  DOCX_MAX_ARCHIVE_ENTRIES,
+  DOCX_MAX_HEADER_FOOTER_PARTS,
+  DOCX_MAX_PART_BYTES,
+  DOCX_MAX_TOTAL_BYTES,
   DOCX_MIME_TYPE,
+  DOCX_TRACK_CHANGES_MODES,
+  type DocxImportReport,
+  type DocxUnmappableItem,
+  type DocxUnmappableKind,
   defaultGoogleDocName,
   doctor,
   encodeSharePointRelativePath,
@@ -32,6 +43,7 @@ import {
   MICROSOFT_GRAPH_DEFAULT_SCOPE,
   PandocError,
   type PandocRunner,
+  type PandocRunnerOptions,
   SHAREPOINT_REQUIRED_APPLICATION_PERMISSION,
   SHAREPOINT_SIMPLE_UPLOAD_MAX_BYTES,
   type SharePointAccessTokenProvider,
@@ -54,6 +66,14 @@ const fixtureInputPath = "tests/fixtures/golden/publish/basic-note/input.md";
 const fixtureExpectedDocumentXmlPath =
   "tests/fixtures/golden/publish/basic-note/expected.document.xml";
 const fixtureReferenceDocxPath = "tests/fixtures/reference/reference.docx";
+const fixtureRoundTripExpectedPath = "tests/fixtures/golden/roundtrip/basic-note/expected.md";
+/** Smallest valid 1x1 PNG, used as embedded DOCX media. */
+const TINY_PNG = Uint8Array.from(
+  Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+    "base64",
+  ),
+);
 
 const realPandocProbe = await doctor();
 const canRepresentUnreadableFiles = process.platform !== "win32" && process.getuid?.() !== 0;
@@ -542,6 +562,931 @@ describe("markdown to DOCX conversion", () => {
   });
 });
 
+describe("DOCX import report", () => {
+  it("reports nothing for a clean document, including Pandoc's always-present empty comments part", () => {
+    const report = buildDocxImportReport(
+      createDocxArchive({
+        "word/document.xml": documentXml("<w:p><w:r><w:t>Plain text.</w:t></w:r></w:p>"),
+        // Every Pandoc-generated DOCX carries this part with no comment bodies,
+        // so its presence alone must never be reported as a loss.
+        "word/comments.xml": '<w:comments xmlns:w="urn:w" />',
+      }),
+    );
+
+    expect(report).toEqual({
+      unmappable: [],
+      hasUnmappableContent: false,
+      trackChanges: "accept",
+      trackedChanges: { insertions: 0, deletions: 0, formattingChanges: 0 },
+      documentPart: "word/document.xml",
+      scannedParts: ["word/document.xml"],
+    });
+  });
+
+  it("counts comment bodies rather than the comments part or its root element", () => {
+    const report = buildDocxImportReport(
+      createDocxArchive({
+        "word/comments.xml": [
+          '<w:comments xmlns:w="urn:w">',
+          '<w:comment w:id="1" w:author="Reviewer One"><w:p><w:r><w:t>First.</w:t></w:r></w:p></w:comment>',
+          '<w:comment w:id="2" w:author="Reviewer Two"><w:p><w:r><w:t>Second.</w:t></w:r></w:p></w:comment>',
+          "</w:comments>",
+        ].join(""),
+      }),
+    );
+
+    expect(findUnmappable(report, "comment")).toMatchObject({
+      kind: "comment",
+      count: 2,
+      summary: expect.stringContaining("--track-changes=all"),
+    });
+  });
+
+  it("counts tracked insertions and deletions without matching lookalike elements", () => {
+    const report = buildDocxImportReport(
+      createDocxArchive({
+        "word/document.xml": documentXml(
+          [
+            "<w:tbl><w:tblPr><w:tblBorders>",
+            // `w:insideH`/`w:insideV` are table borders, `w:delText` is the body
+            // of a deletion, and `w:moveFromRangeStart` is a range marker, so
+            // none of them is a revision mark itself.
+            '<w:insideH w:val="single" /><w:insideV w:val="single" />',
+            "</w:tblBorders></w:tblPr></w:tbl>",
+            "<w:p>",
+            '<w:ins w:id="1" w:author="A"><w:r><w:t>added</w:t></w:r></w:ins>',
+            '<w:ins w:id="2" w:author="B"><w:r><w:t>also added</w:t></w:r></w:ins>',
+            '<w:moveFromRangeStart w:id="8" w:name="move1" />',
+            '<w:del w:id="3" w:author="A"><w:r><w:delText>removed</w:delText></w:r></w:del>',
+            "</w:p>",
+          ].join(""),
+        ),
+      }),
+    );
+
+    expect(report.trackedChanges).toEqual({
+      insertions: 2,
+      deletions: 1,
+      formattingChanges: 0,
+    });
+    expect(findUnmappable(report, "tracked-change")).toMatchObject({
+      kind: "tracked-change",
+      count: 3,
+      summary: expect.stringContaining("--track-changes=accept"),
+    });
+  });
+
+  it("counts tracked moves, which Word writes as neither w:ins nor w:del", () => {
+    const report = buildDocxImportReport(
+      createDocxArchive({
+        "word/document.xml": documentXml(
+          [
+            "<w:p>",
+            '<w:moveFrom w:id="1" w:author="A"><w:r><w:t>moved away</w:t></w:r></w:moveFrom>',
+            '<w:moveTo w:id="2" w:author="A"><w:r><w:t>moved here</w:t></w:r></w:moveTo>',
+            "</w:p>",
+          ].join(""),
+        ),
+      }),
+    );
+
+    // Verified against Pandoc 3.10: --track-changes=all renders w:moveFrom as
+    // class="deletion" and w:moveTo as class="insertion", so a reorganized
+    // document loses its moveFrom text under accept exactly like a deletion.
+    expect(report.trackedChanges).toMatchObject({ insertions: 1, deletions: 1 });
+    expect(findUnmappable(report, "tracked-change")).toBeDefined();
+  });
+
+  it("counts formatting-only revisions, which no track-changes mode preserves", () => {
+    const report = buildDocxImportReport(
+      createDocxArchive({
+        "word/document.xml": documentXml(
+          '<w:p><w:r><w:rPr><w:b /><w:rPrChange w:id="1" w:author="A"><w:rPr /></w:rPrChange></w:rPr><w:t>styled</w:t></w:r></w:p>',
+        ),
+      }),
+      "all",
+    );
+
+    expect(report.trackedChanges).toMatchObject({ formattingChanges: 1 });
+    expect(findUnmappable(report, "tracked-change")).toMatchObject({
+      count: 1,
+      summary: expect.stringContaining("no representation for a formatting-only revision"),
+    });
+  });
+
+  it("classifies text boxes by whether a fallback exists, not by namespace", () => {
+    const report = buildDocxImportReport(
+      createDocxArchive({
+        "word/document.xml": documentXml(
+          [
+            // Word 2010+ writes DrawingML plus a VML mc:Fallback. Verified
+            // against Pandoc 3.10: the fallback is read, so the text survives.
+            "<w:p><w:r><mc:AlternateContent>",
+            '<mc:Choice Requires="wps"><w:drawing><wps:txbx><w:txbxContent><w:p><w:r><w:t>Modern</w:t></w:r></w:p></w:txbxContent></wps:txbx></w:drawing></mc:Choice>',
+            "<mc:Fallback><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>Modern</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback>",
+            "</mc:AlternateContent></w:r></w:p>",
+            // Bare legacy VML is also inlined.
+            "<w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>Legacy</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>",
+            // DrawingML with no fallback is the only form actually dropped.
+            "<w:p><w:r><mc:AlternateContent>",
+            '<mc:Choice Requires="wps"><w:drawing><wps:txbx><w:txbxContent><w:p><w:r><w:t>Orphan</w:t></w:r></w:p></w:txbxContent></wps:txbx></w:drawing></mc:Choice>',
+            "</mc:AlternateContent></w:r></w:p>",
+            // Bare DrawingML, no wrapper at all, is dropped too.
+            "<w:p><w:r><w:drawing><wps:txbx><w:txbxContent><w:p><w:r><w:t>Bare</w:t></w:r></w:p></w:txbxContent></wps:txbx></w:drawing></w:r></w:p>",
+          ].join(""),
+        ),
+      }),
+    );
+
+    expect(findUnmappable(report, "text-box")).toMatchObject({
+      kind: "text-box",
+      count: 4,
+      summary: expect.stringContaining("2 inlined as ordinary body paragraphs"),
+    });
+    expect(findUnmappable(report, "text-box")?.summary).toContain("2 dropped outright");
+  });
+
+  it("counts a text box once when an AlternateContent is nested inside a fallback", () => {
+    const report = buildDocxImportReport(
+      createDocxArchive({
+        "word/document.xml": documentXml(
+          [
+            "<w:p><w:r><mc:AlternateContent>",
+            '<mc:Choice Requires="wps"><w:drawing><wps:txbx><w:txbxContent><w:p><w:r><w:t>Outer</w:t></w:r></w:p></w:txbxContent></wps:txbx></w:drawing></mc:Choice>',
+            // A non-greedy paired-tag pattern would stop at the inner closing
+            // tag here, orphan the outer one, and leak un-stripped content.
+            "<mc:Fallback><mc:AlternateContent><mc:Choice><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>Outer</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></mc:Choice></mc:AlternateContent></mc:Fallback>",
+            "</mc:AlternateContent></w:r></w:p>",
+          ].join(""),
+        ),
+      }),
+    );
+
+    expect(findUnmappable(report, "text-box")).toMatchObject({ count: 1 });
+  });
+
+  it("reports embedded media and OLE objects with their sorted archive part names", () => {
+    const report = buildDocxImportReport(
+      createDocxArchive({
+        "word/media/image2.png": new Uint8Array([2]),
+        "word/media/image1.png": new Uint8Array([1]),
+        "word/embeddings/oleObject1.bin": new Uint8Array([3]),
+      }),
+    );
+
+    expect(findUnmappable(report, "embedded-media")).toMatchObject({
+      kind: "embedded-media",
+      count: 2,
+      entries: ["word/media/image1.png", "word/media/image2.png"],
+      summary: expect.stringContaining("--extract-media"),
+    });
+    expect(findUnmappable(report, "embedded-object")).toMatchObject({
+      kind: "embedded-object",
+      count: 1,
+      entries: ["word/embeddings/oleObject1.bin"],
+    });
+  });
+
+  it("reports headers and footers that hold text, and ignores empty boilerplate ones", () => {
+    const report = buildDocxImportReport(
+      createDocxArchive({
+        "word/header1.xml":
+          '<w:hdr xmlns:w="urn:w"><w:p><w:r><w:t>Running title.</w:t></w:r></w:p></w:hdr>',
+        "word/footer1.xml":
+          '<w:ftr xmlns:w="urn:w"><w:p><w:r><w:t>Page footer.</w:t></w:r></w:p></w:ftr>',
+        // No w:t anywhere, so this one is Word furniture rather than content.
+        "word/header2.xml": '<w:hdr xmlns:w="urn:w"><w:p /></w:hdr>',
+      }),
+    );
+
+    expect(findUnmappable(report, "header-footer")).toMatchObject({
+      kind: "header-footer",
+      count: 2,
+      entries: ["word/footer1.xml", "word/header1.xml"],
+      summary: expect.stringContaining("ignores headers and footers entirely"),
+    });
+  });
+
+  it("counts revisions inside footnotes and endnotes, whose text does reach the Markdown", () => {
+    const report = buildDocxImportReport(
+      createDocxArchive({
+        "word/footnotes.xml": [
+          '<w:footnotes xmlns:w="urn:w"><w:footnote w:id="2"><w:p>',
+          '<w:del w:id="1" w:author="A"><w:r><w:delText>cut from a footnote</w:delText></w:r></w:del>',
+          "</w:p></w:footnote></w:footnotes>",
+        ].join(""),
+        "word/endnotes.xml": [
+          '<w:endnotes xmlns:w="urn:w"><w:endnote w:id="2"><w:p>',
+          '<w:ins w:id="2" w:author="A"><w:r><w:t>added to an endnote</w:t></w:r></w:ins>',
+          "</w:p></w:endnote></w:endnotes>",
+        ].join(""),
+      }),
+    );
+
+    // Verified against Pandoc 3.10: a tracked deletion inside a footnote is
+    // resolved away exactly like one in the body, so scanning only the document
+    // part would let it vanish with a clean report.
+    expect(report.scannedParts).toEqual([
+      "word/document.xml",
+      "word/footnotes.xml",
+      "word/endnotes.xml",
+    ]);
+    expect(report.trackedChanges).toMatchObject({ insertions: 1, deletions: 1 });
+  });
+
+  it("reports SmartArt and charts, which live outside the media and embeddings prefixes", () => {
+    const report = buildDocxImportReport(
+      createDocxArchive({
+        "word/diagrams/data1.xml": '<dgm:dataModel xmlns:dgm="urn:d" />',
+        "word/diagrams/layout1.xml": '<dgm:layoutDef xmlns:dgm="urn:d" />',
+        "word/charts/chart1.xml": '<c:chartSpace xmlns:c="urn:c" />',
+        "word/charts/style1.xml": '<cs:chartStyle xmlns:cs="urn:cs" />',
+      }),
+    );
+
+    // One SmartArt graphic spans several parts, so the data part is what makes
+    // it countable; the same holds for a chart.
+    expect(findUnmappable(report, "smart-art")).toMatchObject({
+      kind: "smart-art",
+      count: 1,
+      entries: ["word/diagrams/data1.xml", "word/diagrams/layout1.xml"],
+    });
+    expect(findUnmappable(report, "chart")).toMatchObject({
+      kind: "chart",
+      count: 1,
+      entries: ["word/charts/chart1.xml", "word/charts/style1.xml"],
+    });
+  });
+
+  it("reports altChunk imports, whose embedded document Pandoc never reads", () => {
+    const report = buildDocxImportReport(
+      createDocxArchive({
+        "word/document.xml": documentXml('<w:altChunk r:id="rId9" /><w:altChunk r:id="rId10" />'),
+      }),
+    );
+
+    expect(findUnmappable(report, "external-content")).toMatchObject({
+      kind: "external-content",
+      count: 2,
+      summary: expect.stringContaining("altChunk"),
+    });
+  });
+
+  it("resolves the main document part from the package relationships", () => {
+    // Verified against Pandoc 3.10: it converts this document fine, so assuming
+    // word/document.xml would reject a valid Word file as "not a Word document".
+    const report = buildDocxImportReport(
+      createDocxArchive({
+        "_rels/.rels": [
+          '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+          '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="/word/document2.xml" />',
+          "</Relationships>",
+        ].join(""),
+        "word/document2.xml": documentXml(
+          '<w:p><w:ins w:id="1" w:author="A"><w:r><w:t>added</w:t></w:r></w:ins></w:p>',
+        ),
+        "word/document.xml": undefined,
+      }),
+    );
+
+    expect(report.documentPart).toBe("word/document2.xml");
+    expect(report.scannedParts).toEqual(["word/document2.xml"]);
+    expect(report.trackedChanges).toMatchObject({ insertions: 1 });
+  });
+
+  it("refuses to inflate an oversized part instead of exhausting memory", () => {
+    // A small archive whose main part inflates past the per-part cap: a
+    // compression ratio near 300:1. Without the cap an earlier build of this
+    // shape allocated 242 MB of resident memory in 545 ms, scaling linearly
+    // with the input. Sized just over the cap so the fixture stays cheap.
+    const bomb = zipSync(
+      { "word/document.xml": createRepetitiveXmlPart(DOCX_MAX_PART_BYTES + 1024) },
+      { level: 1 },
+    );
+
+    expect(bomb.byteLength).toBeLessThan(2 * 1024 * 1024);
+    expect(() => buildDocxImportReport(bomb)).toThrow(
+      expect.objectContaining({
+        name: "PandocError",
+        code: "DOCX_ARCHIVE_INVALID",
+        message: expect.stringContaining("over the"),
+      }),
+    );
+  }, 30_000);
+
+  it("refuses many individually plausible parts that exceed the total budget", () => {
+    // The shape neither other limit catches: every part is honestly declared
+    // and comfortably under the per-part cap, and the entry count is modest,
+    // but the aggregate blows past the budget. Enumerating header parts is
+    // what removed the fixed-part-set invariant that used to make the
+    // per-part cap an aggregate cap, so this is the test that holds the
+    // budget in place.
+    //
+    // The fixture is the least data that can prove that: just over the
+    // budget, spread across the fewest parts, at the cheapest compression
+    // level. It still costs ~1.3s because ~128 MB genuinely has to be
+    // deflated, hence the explicit timeout below rather than silently
+    // sitting near the default.
+    const partCount = 10;
+    const part = createRepetitiveXmlPart(Math.ceil(DOCX_MAX_TOTAL_BYTES / partCount) + 1024);
+    const entries: Record<string, Uint8Array> = {
+      "word/document.xml": strToU8(documentXml("<w:p />")),
+    };
+
+    for (let index = 1; index <= partCount; index += 1) {
+      entries[`word/header${index}.xml`] = part;
+    }
+
+    // Every other guard must be satisfied, or this would prove nothing about
+    // the budget specifically.
+    expect(part.byteLength).toBeLessThan(DOCX_MAX_PART_BYTES);
+    expect(partCount).toBeLessThanOrEqual(DOCX_MAX_HEADER_FOOTER_PARTS);
+    expect(Object.keys(entries).length).toBeLessThan(DOCX_MAX_ARCHIVE_ENTRIES);
+    expect(part.byteLength * partCount).toBeGreaterThan(DOCX_MAX_TOTAL_BYTES);
+
+    expect(() => buildDocxImportReport(zipSync(entries, { level: 1 }))).toThrow(
+      expect.objectContaining({
+        name: "PandocError",
+        code: "DOCX_ARCHIVE_INVALID",
+        message: expect.stringContaining("in total"),
+      }),
+    );
+  }, 30_000);
+
+  it("refuses an implausible number of header and footer parts", () => {
+    const entries: Record<string, Uint8Array> = {
+      "word/document.xml": strToU8(documentXml("<w:p />")),
+    };
+
+    for (let index = 0; index <= DOCX_MAX_HEADER_FOOTER_PARTS; index += 1) {
+      entries[`word/header${index}.xml`] = strToU8('<w:hdr xmlns:w="urn:w" />');
+    }
+
+    expect(() => buildDocxImportReport(zipSync(entries))).toThrow(
+      expect.objectContaining({
+        name: "PandocError",
+        code: "DOCX_ARCHIVE_INVALID",
+        message: expect.stringContaining("header and footer parts"),
+      }),
+    );
+  });
+
+  // Both levels matter. A stored entry is sliced using its COMPRESSED size, so
+  // an understated uncompressed size is visible as a length mismatch. A deflate
+  // entry — every real .docx, and anything an attacker would build — is
+  // inflated into a buffer pre-sized from that same understated number, so the
+  // inflated length always equals it and a length comparison is tautological.
+  // Only the CRC catches the deflate case.
+  it.each([
+    ["stored", 0],
+    ["deflate", 9],
+  ])(
+    "refuses a %s part whose entry understates its real size instead of analyzing a fragment",
+    (_label, level) => {
+      // The revision sits past byte 5000, so a 512-byte fragment hides it and
+      // the report would come back clean for a document Pandoc reads in full.
+      const body = documentXml(
+        `<w:p><w:r><w:t>${"padding ".repeat(
+          700,
+        )}</w:t></w:r></w:p><w:ins w:id="1" w:author="A"><w:r><w:t>SECRET-INSERTION</w:t></w:r></w:ins>`,
+      );
+      const archive = zipSync({ "word/document.xml": strToU8(body) }, { level: level as 0 | 9 });
+      const view = new DataView(archive.buffer, archive.byteOffset, archive.byteLength);
+      let patched = false;
+
+      // Rewrite the uncompressed-size field in both the local header and the
+      // central directory record so the entry claims far less than it holds.
+      for (let offset = 0; offset + 4 <= archive.byteLength; offset += 1) {
+        const signature = view.getUint32(offset, true);
+
+        if (signature === 0x0403_4b50) {
+          view.setUint32(offset + 22, 512, true);
+          patched = true;
+        } else if (signature === 0x0201_4b50) {
+          view.setUint32(offset + 24, 512, true);
+          patched = true;
+        }
+      }
+
+      expect(patched).toBe(true);
+      expect(() => buildDocxImportReport(archive)).toThrow(
+        expect.objectContaining({
+          name: "PandocError",
+          code: "DOCX_ARCHIVE_INVALID",
+        }),
+      );
+    },
+  );
+
+  it("catches the deflate truncation by checksum, the only check that can", () => {
+    // Pinning the mechanism, not just the rejection: for a deflate entry the
+    // inflated length always equals the declared size, so if this ever starts
+    // failing on the size check instead, the CRC has stopped doing the work.
+    const body = documentXml(
+      `<w:p><w:r><w:t>${"padding ".repeat(
+        700,
+      )}</w:t></w:r></w:p><w:ins w:id="1" w:author="A"><w:r><w:t>SECRET-INSERTION</w:t></w:r></w:ins>`,
+    );
+    const archive = zipSync({ "word/document.xml": strToU8(body) }, { level: 9 });
+    const view = new DataView(archive.buffer, archive.byteOffset, archive.byteLength);
+
+    for (let offset = 0; offset + 4 <= archive.byteLength; offset += 1) {
+      const signature = view.getUint32(offset, true);
+
+      if (signature === 0x0403_4b50) {
+        view.setUint32(offset + 22, 512, true);
+      } else if (signature === 0x0201_4b50) {
+        view.setUint32(offset + 24, 512, true);
+      }
+    }
+
+    expect(() => buildDocxImportReport(archive)).toThrow(
+      expect.objectContaining({
+        code: "DOCX_ARCHIVE_INVALID",
+        message: expect.stringContaining("CRC-32"),
+      }),
+    );
+  });
+
+  it("accepts an honest archive at every compression level the CRC check sees", () => {
+    // A checksum check that false-positives on real Word output would be worse
+    // than the hole it closes, so both storage modes are asserted to pass.
+    for (const level of [0, 6, 9] as const) {
+      const archive = zipSync(
+        {
+          "word/document.xml": strToU8(documentXml("<w:p><w:r><w:t>Plain text.</w:t></w:r></w:p>")),
+          "word/comments.xml": strToU8('<w:comments xmlns:w="urn:w" />'),
+          "word/footnotes.xml": strToU8('<w:footnotes xmlns:w="urn:w" />'),
+        },
+        { level },
+      );
+
+      expect(buildDocxImportReport(archive).unmappable).toEqual([]);
+    }
+  });
+
+  it("resolves a main document part named with single-quoted attributes", () => {
+    const report = buildDocxImportReport(
+      createDocxArchive({
+        "_rels/.rels": [
+          "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>",
+          "<Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument' Target='word/document2.xml' />",
+          "</Relationships>",
+        ].join(""),
+        "word/document2.xml": documentXml("<w:p><w:r><w:t>Body.</w:t></w:r></w:p>"),
+        "word/document.xml": undefined,
+      }),
+    );
+
+    expect(report.documentPart).toBe("word/document2.xml");
+  });
+
+  it("explains that the relationships named no usable target, not that a part is missing", () => {
+    expect(() =>
+      buildDocxImportReport(
+        createDocxArchive({
+          "_rels/.rels": [
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/absent.xml" />',
+            "</Relationships>",
+          ].join(""),
+          "word/document.xml": undefined,
+        }),
+      ),
+    ).toThrow(
+      expect.objectContaining({
+        name: "PandocError",
+        code: "DOCX_ARCHIVE_INVALID",
+        message: expect.stringContaining("no officeDocument target present in the archive"),
+      }),
+    );
+  });
+
+  it("refuses an archive with an implausible number of entries", () => {
+    const entries: Record<string, Uint8Array> = {};
+
+    for (let index = 0; index <= DOCX_MAX_ARCHIVE_ENTRIES; index += 1) {
+      entries[`word/media/image${index}.png`] = new Uint8Array([0]);
+    }
+
+    expect(() => buildDocxImportReport(zipSync(entries))).toThrow(
+      expect.objectContaining({
+        name: "PandocError",
+        code: "DOCX_ARCHIVE_INVALID",
+        message: expect.stringContaining("entries"),
+      }),
+    );
+  });
+
+  it("surfaces every unmappable kind at once for a document that has all of them", () => {
+    const report = buildDocxImportReport(createKitchenSinkDocx());
+
+    expect(report.hasUnmappableContent).toBe(true);
+    expect(report.unmappable.map((item) => item.kind)).toEqual([
+      "tracked-change",
+      "comment",
+      "header-footer",
+      "text-box",
+      "external-content",
+      "smart-art",
+      "chart",
+      "embedded-media",
+      "embedded-object",
+    ]);
+  });
+
+  it("stops reporting comments and revisions as losses when Pandoc keeps them as spans", () => {
+    const report = buildDocxImportReport(createKitchenSinkDocx(), "all");
+
+    // Verified against Pandoc 3.10: --track-changes=all emits insertion,
+    // deletion, comment-start, and comment-end spans instead of dropping them,
+    // so neither is a loss in that mode. The counts stay on the report, and
+    // every loss that does not depend on the mode still reports.
+    expect(report.unmappable.map((item) => item.kind)).toEqual([
+      "header-footer",
+      "text-box",
+      "external-content",
+      "smart-art",
+      "chart",
+      "embedded-media",
+      "embedded-object",
+    ]);
+    expect(report.trackChanges).toBe("all");
+    expect(report.trackedChanges).toMatchObject({ insertions: 1, deletions: 1 });
+  });
+
+  it.each([
+    [
+      "a manual page break, which is layout rather than content",
+      documentXml('<w:p><w:r><w:br w:type="page" /></w:r></w:p>'),
+    ],
+    [
+      "direct character formatting with no Markdown equivalent",
+      documentXml(
+        '<w:p><w:r><w:rPr><w:highlight w:val="yellow" /><w:spacing w:val="40" /></w:rPr><w:t>styled</w:t></w:r></w:p>',
+      ),
+    ],
+  ])("does not claim to detect %s", (_label, body) => {
+    const report = buildDocxImportReport(createDocxArchive({ "word/document.xml": body }));
+
+    // These are real fidelity losses that this report deliberately does not
+    // cover. The test exists so the gap stays a decision rather than becoming
+    // an accidental promise that an empty `unmappable` means a lossless import.
+    expect(report.unmappable).toEqual([]);
+  });
+
+  it("reports insertions as discarded when revisions are rejected", () => {
+    const report = buildDocxImportReport(createKitchenSinkDocx(), "reject");
+
+    expect(findUnmappable(report, "tracked-change")?.summary).toContain(
+      "deletions were restored as ordinary text and insertions were discarded",
+    );
+  });
+
+  it.each([
+    ["empty bytes", new Uint8Array()],
+    ["plain text that is not a ZIP", strToU8("# This is Markdown, not a DOCX")],
+    ["a legacy .doc OLE compound file header", new Uint8Array([0xd0, 0xcf, 0x11, 0xe0, 0xa1])],
+  ])("rejects %s as invalid DOCX input", (_label, bytes) => {
+    expect(() => buildDocxImportReport(bytes)).toThrow(
+      expect.objectContaining({
+        name: "PandocError",
+        code: "DOCX_INPUT_INVALID",
+      }),
+    );
+  });
+
+  it("rejects a ZIP archive that is not a Word document", () => {
+    expect(() => buildDocxImportReport(zipSync({ mimetype: strToU8("text/plain") }))).toThrow(
+      expect.objectContaining({
+        name: "PandocError",
+        code: "DOCX_ARCHIVE_INVALID",
+        message: expect.stringContaining("word/document.xml"),
+      }),
+    );
+  });
+
+  it("rejects a truncated ZIP archive", () => {
+    const truncated = createDocxArchive().slice(0, 40);
+
+    expect(() => buildDocxImportReport(truncated)).toThrow(
+      expect.objectContaining({
+        name: "PandocError",
+        code: "DOCX_ARCHIVE_INVALID",
+      }),
+    );
+  });
+
+  it.each(["", "ACCEPT", "yes", 1, null])("rejects invalid trackChanges value %j", (mode) => {
+    expect(() => buildDocxImportReport(createDocxArchive(), mode as unknown as "accept")).toThrow(
+      expect.objectContaining({
+        name: "PandocError",
+        code: "DOCX_TRACK_CHANGES_INVALID",
+      }),
+    );
+  });
+
+  it("exposes the supported track-changes modes and the clean-Markdown default", () => {
+    expect(DOCX_TRACK_CHANGES_MODES).toEqual(["accept", "reject", "all"]);
+    expect(DEFAULT_DOCX_TRACK_CHANGES).toBe("accept");
+  });
+});
+
+describe("DOCX to Markdown conversion", () => {
+  it("fails closed when Pandoc is unsupported before touching the DOCX input", async () => {
+    const runner: PandocRunner = vi.fn(async () => ({
+      stdout: "pandoc 2.19",
+      stderr: "",
+      exitCode: 0,
+    }));
+
+    await expect(
+      convertDocxToMarkdown({ docx: createDocxArchive(), runner }),
+    ).rejects.toMatchObject({
+      name: "PandocError",
+      code: "PANDOC_UNSUPPORTED_MAJOR",
+    });
+    expect(runner).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses argument arrays with an explicit track-changes value and no writer env", async () => {
+    const calls: Array<{
+      binary: string;
+      args: readonly string[];
+      options: PandocRunnerOptions | undefined;
+    }> = [];
+    const docx = createDocxArchive();
+    const runner: PandocRunner = vi.fn(async (binary, args, options) => {
+      calls.push({ binary, args, options });
+
+      if (args[0] === "--version") {
+        return { stdout: "pandoc 3.10\nFeatures: +lua", stderr: "", exitCode: 0 };
+      }
+
+      const outputPath = args[args.indexOf("--output") + 1];
+      const inputPath = args.at(-1);
+
+      if (outputPath === undefined || inputPath === undefined) {
+        throw new Error("test runner received an incomplete invocation");
+      }
+
+      // The bytes handed to Pandoc are the bytes the caller passed in.
+      expect(new Uint8Array(await readFile(inputPath))).toEqual(docx);
+      await writeFile(outputPath, "# Converted\n");
+
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+
+    const result = await convertDocxToMarkdown({ docx, runner });
+
+    expect(result.markdown).toBe("# Converted\n");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toEqual({
+      binary: "pandoc",
+      args: [
+        "--from",
+        "docx",
+        "--to",
+        "gfm",
+        "--track-changes",
+        "accept",
+        "--output",
+        expect.stringMatching(/output\.md$/),
+        expect.stringMatching(/input\.docx$/),
+      ],
+      options: { reject: false },
+    });
+    // SOURCE_DATE_EPOCH only matters to the DOCX writer; Markdown output has no
+    // embedded timestamps, so the reverse path passes no environment at all.
+    expect(calls[1]?.options?.env).toBeUndefined();
+  });
+
+  it("passes an explicitly requested track-changes value through to Pandoc", async () => {
+    const runner = createReverseRunner("# Converted\n");
+
+    const result = await convertDocxToMarkdown({
+      docx: createKitchenSinkDocx(),
+      trackChanges: "all",
+      runner,
+    });
+
+    expect(runner).toHaveBeenLastCalledWith(
+      "pandoc",
+      expect.arrayContaining(["--track-changes", "all"]),
+      { reject: false },
+    );
+    expect(result.report.trackChanges).toBe("all");
+  });
+
+  it("rejects an invalid track-changes value before writing any conversion files", async () => {
+    const runner = createSuccessfulDoctorRunner();
+
+    await expect(
+      convertDocxToMarkdown({
+        docx: createDocxArchive(),
+        trackChanges: "maybe" as unknown as "accept",
+        runner,
+      }),
+    ).rejects.toMatchObject({
+      name: "PandocError",
+      code: "DOCX_TRACK_CHANGES_INVALID",
+    });
+    expect(runner).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs postprocessors in order with reverse Markdown context and returns the report", async () => {
+    const seen: string[] = [];
+    const result = await convertDocxToMarkdown({
+      docx: createKitchenSinkDocx(),
+      metadata: { source: "fixture" },
+      postprocessors: [
+        (markdown, context) => {
+          seen.push(`${context.phase}:${context.sourceFormat}:${context.targetFormat}`);
+          return `${markdown}first\n`;
+        },
+        async (markdown, context) => {
+          seen.push(`${context.phase}:${String(context.metadata.source)}`);
+          return `${markdown}second\n`;
+        },
+      ],
+      runner: createReverseRunner("# Converted\n"),
+    });
+
+    expect(result.markdown).toBe("# Converted\nfirst\nsecond\n");
+    expect(seen).toEqual(["postprocess:markdown:markdown", "postprocess:fixture"]);
+    // The report describes the DOCX, so postprocessors cannot mask a loss.
+    expect(result.report.hasUnmappableContent).toBe(true);
+  });
+
+  it("wraps postprocessor failures in typed hook errors", async () => {
+    await expect(
+      convertDocxToMarkdown({
+        docx: createDocxArchive(),
+        postprocessors: [
+          () => {
+            throw new Error("sidecar lookup exploded");
+          },
+        ],
+        runner: createReverseRunner("# Converted\n"),
+      }),
+    ).rejects.toMatchObject({
+      name: "PandocError",
+      code: "MARKDOWN_HOOK_FAILED",
+    });
+  });
+
+  it("reads a DOCX from a filesystem path", async () => {
+    const docxPath = join(await createTempDirectory(), "note.docx");
+    await writeFile(docxPath, createDocxArchive());
+
+    const result = await convertDocxToMarkdown({
+      docx: docxPath,
+      runner: createReverseRunner("# From path\n"),
+    });
+
+    expect(result.markdown).toBe("# From path\n");
+  });
+
+  it.each([
+    ["a missing path", "tests/fixtures/golden/missing-note.docx"],
+    ["a blank path", "   "],
+  ])("rejects %s with a typed input error", async (_label, docx) => {
+    const runner = createSuccessfulDoctorRunner();
+
+    await expect(convertDocxToMarkdown({ docx, runner })).rejects.toMatchObject({
+      name: "PandocError",
+      code: "DOCX_INPUT_INVALID",
+    });
+    expect(runner).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["garbage that is not a ZIP", strToU8("not a docx"), "DOCX_INPUT_INVALID"],
+    [
+      "a ZIP that is not a Word document",
+      zipSync({ "a.txt": strToU8("hi") }),
+      "DOCX_ARCHIVE_INVALID",
+    ],
+  ])("rejects %s before invoking Pandoc's converter", async (_label, docx, code) => {
+    const runner = createSuccessfulDoctorRunner();
+
+    await expect(convertDocxToMarkdown({ docx, runner })).rejects.toMatchObject({
+      name: "PandocError",
+      code,
+    });
+    // Only the version probe ran, so garbage never reached the converter.
+    expect(runner).toHaveBeenCalledTimes(1);
+  });
+
+  it("cleans up temporary files when Pandoc conversion fails", async () => {
+    let tempOutputPath: string | undefined;
+    const runner: PandocRunner = vi.fn(async (_binary, args) => {
+      if (args[0] === "--version") {
+        return { stdout: "pandoc 3.10", stderr: "", exitCode: 0 };
+      }
+
+      tempOutputPath = args[args.indexOf("--output") + 1];
+
+      return { stdout: "", stderr: "unsupported docx feature", exitCode: 43 };
+    });
+
+    await expect(
+      convertDocxToMarkdown({ docx: createDocxArchive(), runner }),
+    ).rejects.toMatchObject({
+      name: "PandocError",
+      code: "PANDOC_CONVERSION_FAILED",
+      guidance: expect.stringContaining("Pandoc stderr: unsupported docx feature"),
+    });
+
+    expect(tempOutputPath).toBeDefined();
+    await expect(stat(join(tempOutputPath ?? "", ".."))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("wraps missing Markdown output after exit 0 and cleans up", async () => {
+    let tempOutputPath: string | undefined;
+    const runner: PandocRunner = vi.fn(async (_binary, args) => {
+      if (args[0] === "--version") {
+        return { stdout: "pandoc 3.10", stderr: "", exitCode: 0 };
+      }
+
+      tempOutputPath = args[args.indexOf("--output") + 1];
+
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+
+    await expect(
+      convertDocxToMarkdown({ docx: createDocxArchive(), runner }),
+    ).rejects.toMatchObject({
+      name: "PandocError",
+      code: "PANDOC_CONVERSION_FAILED",
+      message: expect.stringContaining("Markdown output could not be read"),
+    });
+
+    expect(tempOutputPath).toBeDefined();
+    await expect(stat(join(tempOutputPath ?? "", ".."))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("snapshots DOCX bytes so caller mutation cannot desync the report from the output", async () => {
+    let convertedBytes: Uint8Array | undefined;
+    const docx = createKitchenSinkDocx();
+    const runner: PandocRunner = vi.fn(async (_binary, args) => {
+      if (args[0] === "--version") {
+        return { stdout: "pandoc 3.10", stderr: "", exitCode: 0 };
+      }
+
+      const outputPath = args[args.indexOf("--output") + 1];
+      const inputPath = args.at(-1);
+
+      if (outputPath === undefined || inputPath === undefined) {
+        throw new Error("test runner received an incomplete invocation");
+      }
+
+      convertedBytes = new Uint8Array(await readFile(inputPath));
+      await writeFile(outputPath, "# Converted\n");
+
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const original = Uint8Array.from(docx);
+
+    const conversion = convertDocxToMarkdown({ docx, runner });
+    docx.fill(0);
+    const result = await conversion;
+
+    expect(convertedBytes).toEqual(original);
+    expect(result.report.hasUnmappableContent).toBe(true);
+  });
+
+  it("wraps unexpected runner failures and preserves typed ones", async () => {
+    const typedError = new PandocError(
+      "PANDOC_CONVERSION_FAILED",
+      "Injected typed failure.",
+      "Caller guidance.",
+    );
+    const throwingRunner = (cause: unknown): PandocRunner =>
+      vi.fn(async (_binary, args) => {
+        if (args[0] === "--version") {
+          return { stdout: "pandoc 3.10", stderr: "", exitCode: 0 };
+        }
+
+        throw cause;
+      });
+
+    await expect(
+      convertDocxToMarkdown({
+        docx: createDocxArchive(),
+        runner: throwingRunner(new Error("process runner exploded")),
+      }),
+    ).rejects.toMatchObject({
+      name: "PandocError",
+      code: "PANDOC_CONVERSION_FAILED",
+      guidance: expect.stringContaining("pandocPath"),
+    });
+    await expect(
+      convertDocxToMarkdown({ docx: createDocxArchive(), runner: throwingRunner(typedError) }),
+    ).rejects.toBe(typedError);
+  });
+});
+
 describe.skipIf(!realPandocProbe.ok)("Pandoc integration", () => {
   it("converts the golden Markdown fixture to deterministic DOCX bytes", async () => {
     const markdown = await readFile(fixtureInputPath, "utf8");
@@ -563,6 +1508,222 @@ describe.skipIf(!realPandocProbe.ok)("Pandoc integration", () => {
 
     const documentXml = normalizeDocumentXml(first);
     expect(`${documentXml}\n`).toBe(expectedDocumentXml);
+  });
+
+  it("round-trips the golden note back to the golden Markdown fixture", async () => {
+    const markdown = await readFile(fixtureInputPath, "utf8");
+    const expectedMarkdown = await readFile(fixtureRoundTripExpectedPath, "utf8");
+    const docx = await convertMarkdownToDocx({
+      markdown,
+      referenceDocxPath: fixtureReferenceDocxPath,
+      sourceDateEpoch: 1_704_067_200,
+      preprocessors: [stripYamlFrontmatter],
+    });
+
+    const result = await convertDocxToMarkdown({ docx });
+
+    expect(result.markdown).toBe(expectedMarkdown);
+    // A Pandoc-written DOCX carries an empty comments part and no media, so a
+    // clean publish round trip must report no losses at all.
+    expect(result.report).toEqual({
+      unmappable: [],
+      hasUnmappableContent: false,
+      trackChanges: "accept",
+      trackedChanges: { insertions: 0, deletions: 0, formattingChanges: 0 },
+      documentPart: "word/document.xml",
+      scannedParts: ["word/document.xml", "word/footnotes.xml"],
+    });
+  });
+
+  it("documents the round-trip losses the golden fixture records", async () => {
+    const source = await readFile(fixtureInputPath, "utf8");
+    const roundTripped = await readFile(fixtureRoundTripExpectedPath, "utf8");
+
+    // These assertions exist so the golden file cannot be quietly regenerated
+    // into something that hides a loss: the round trip really does drop
+    // frontmatter and really does destroy wikilink syntax.
+    expect(source).toContain("title: Basic TeamWiki Note");
+    expect(roundTripped).not.toContain("title: Basic TeamWiki Note");
+    expect(source).toContain("[[TeamWiki]]");
+    expect(roundTripped).not.toContain("[[TeamWiki]]");
+    expect(roundTripped).toContain(String.raw`\[\[TeamWiki\]\]`);
+  });
+
+  it("restores frontmatter and wikilinks from a consumer-provided sidecar", async () => {
+    const sourceNote = [
+      "---",
+      "title: Sidecar Note",
+      "tags:",
+      "  - teamwiki",
+      "---",
+      "",
+      "# Sidecar Note",
+      "",
+      "This note links to [[TeamWiki]] and [[Handbook]].",
+      "",
+      "A second paragraph with **bold** text.",
+      "",
+      "- First item",
+      "- Second item",
+      "",
+    ].join("\n");
+    // This note is deliberately built to survive Pandoc's re-wrap: short lines,
+    // no callout, no paragraph long enough to be reflowed. That is what makes a
+    // byte-exact assertion possible. The test proves the postprocessor hook
+    // runs and can restore the Obsidian layer, NOT that byte-exact restoration
+    // is achievable for an arbitrary note — the golden round-trip fixture next
+    // to it shows how much a realistic note actually loses.
+    //
+    // The sidecar is the consumer's, not the library's: publishing records what
+    // the DOCX cannot carry, and the reverse import puts it back.
+    const sidecar: { frontmatter: string; wikilinks: string[] } = {
+      frontmatter: "",
+      wikilinks: [],
+    };
+
+    const docx = await convertMarkdownToDocx({
+      markdown: sourceNote,
+      referenceDocxPath: fixtureReferenceDocxPath,
+      sourceDateEpoch: 1_704_067_200,
+      preprocessors: [
+        (markdown) => {
+          const match = /^---\n[\s\S]*?\n---\n\n?/.exec(markdown);
+          sidecar.frontmatter = match?.[0] ?? "";
+
+          return markdown.slice(sidecar.frontmatter.length);
+        },
+        (markdown) =>
+          markdown.replace(/\[\[([^\]]+)\]\]/g, (_match, target: string) => {
+            sidecar.wikilinks.push(target);
+
+            return target;
+          }),
+      ],
+    });
+
+    const result = await convertDocxToMarkdown({
+      docx,
+      postprocessors: [
+        (markdown) => {
+          let restored = markdown;
+
+          // replaceAll, not replace: a string first argument to replace()
+          // rewrites only the first match, so a target that also appears
+          // earlier as ordinary prose would capture the wrapping and leave the
+          // real wikilink bare. Deduplicating targets keeps a repeated link
+          // from being wrapped twice.
+          //
+          // A production consumer needs more than this: a bare target string is
+          // indistinguishable from prose that happens to use the same words, so
+          // the sidecar should record source offsets rather than just names.
+          for (const target of new Set(sidecar.wikilinks)) {
+            restored = restored.replaceAll(target, `[[${target}]]`);
+          }
+
+          return restored;
+        },
+        (markdown) => `${sidecar.frontmatter}${markdown}`,
+      ],
+    });
+
+    expect(sidecar.wikilinks).toEqual(["TeamWiki", "Handbook"]);
+    expect(result.markdown).toBe(sourceNote);
+    expect(result.report.hasUnmappableContent).toBe(false);
+  });
+
+  it("surfaces every unmappable construct from a real DOCX", async () => {
+    const result = await convertDocxToMarkdown({ docx: createKitchenSinkDocx() });
+
+    expect(result.report.unmappable.map((item) => item.kind)).toEqual([
+      "tracked-change",
+      "comment",
+      "header-footer",
+      "text-box",
+      "external-content",
+      "smart-art",
+      "chart",
+      "embedded-media",
+      "embedded-object",
+    ]);
+    // These assertions pin the behavior each summary claims, so a Pandoc
+    // upgrade that changes any of it fails here rather than leaving the report
+    // quietly wrong.
+    //
+    // Accepted: the insertion became ordinary text, the deletion is gone.
+    expect(result.markdown).toContain("INSERTED-TEXT");
+    expect(result.markdown).not.toContain("DELETED-TEXT");
+    // Dropped outright, each with no placeholder of any kind.
+    expect(result.markdown).not.toContain("First reviewer comment.");
+    expect(result.markdown).not.toContain("EMBEDDED-OLE-OBJECT");
+    expect(result.markdown).not.toContain("HEADER-TEXT-CONTENT");
+    expect(result.markdown).not.toContain("SMARTART-NODE-TEXT");
+    expect(result.markdown).not.toContain("CHART-TITLE-TEXT");
+    expect(result.markdown).not.toContain("ALTCHUNK-IMPORTED-TEXT");
+    // Inlined, losing its text-box framing rather than its text.
+    expect(result.markdown).toContain("TEXTBOX-CONTENT");
+    // Referenced but never written: the image link dangles.
+    expect(result.markdown).toContain("media/image1.png");
+  });
+
+  it.each([
+    [
+      "a DrawingML text box with the mc:Fallback Word 2010+ writes",
+      "<w:p><w:r><mc:AlternateContent>" +
+        '<mc:Choice Requires="wps"><w:drawing><wp:inline><wp:extent cx="2000000" cy="500000" /><wp:docPr id="9" name="Text Box 9" /><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:cNvSpPr txBox="1" /><wps:spPr><a:prstGeom prst="rect"><a:avLst /></a:prstGeom></wps:spPr><wps:txbx><w:txbxContent><w:p><w:r><w:t>TEXTBOX-PROBE</w:t></w:r></w:p></w:txbxContent></wps:txbx><wps:bodyPr rot="0" /></wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing></mc:Choice>' +
+        '<mc:Fallback><w:pict><v:shape id="_x0000_s2051" type="#_x0000_t202" style="width:150pt;height:40pt"><v:textbox><w:txbxContent><w:p><w:r><w:t>TEXTBOX-PROBE</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback>' +
+        "</mc:AlternateContent></w:r></w:p>",
+      1,
+      0,
+      true,
+    ],
+    [
+      "a DrawingML text box with no fallback",
+      "<w:p><w:r><mc:AlternateContent>" +
+        '<mc:Choice Requires="wps"><w:drawing><wp:inline><wp:extent cx="2000000" cy="500000" /><wp:docPr id="9" name="Text Box 9" /><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:cNvSpPr txBox="1" /><wps:spPr><a:prstGeom prst="rect"><a:avLst /></a:prstGeom></wps:spPr><wps:txbx><w:txbxContent><w:p><w:r><w:t>TEXTBOX-PROBE</w:t></w:r></w:p></w:txbxContent></wps:txbx><wps:bodyPr rot="0" /></wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing></mc:Choice>' +
+        "</mc:AlternateContent></w:r></w:p>",
+      0,
+      1,
+      false,
+    ],
+    [
+      "a bare legacy VML text box",
+      '<w:p><w:r><w:pict><v:shape id="_x0000_s1026" type="#_x0000_t202" style="width:150pt;height:40pt"><v:textbox><w:txbxContent><w:p><w:r><w:t>TEXTBOX-PROBE</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>',
+      1,
+      0,
+      true,
+    ],
+  ])(
+    "classifies %s the way Pandoc actually treats it",
+    async (_label, body, inlined, dropped, textSurvives) => {
+      const result = await convertDocxToMarkdown({
+        docx: createDocxArchive({ "word/document.xml": documentXml(body) }),
+      });
+
+      // The report's classification and Pandoc's real behavior are asserted
+      // against each other. This case is what caught the classification being
+      // inverted: the fallback, not the namespace, decides.
+      expect(findUnmappable(result.report, "text-box")?.summary).toContain(
+        `${inlined} inlined as ordinary body paragraphs`,
+      );
+      expect(findUnmappable(result.report, "text-box")?.summary).toContain(
+        `${dropped} dropped outright`,
+      );
+      expect(result.markdown.includes("TEXTBOX-PROBE")).toBe(textSurvives);
+    },
+  );
+
+  it("reports a header that Pandoc drops, so an empty report never hides one", async () => {
+    const result = await convertDocxToMarkdown({
+      docx: createDocxArchive({
+        "word/header1.xml": `<w:hdr ${DOCX_NAMESPACES}><w:p><w:r><w:t>HEADER-TEXT-CONTENT</w:t></w:r></w:p></w:hdr>`,
+      }),
+    });
+
+    expect(result.markdown).not.toContain("HEADER-TEXT-CONTENT");
+    expect(findUnmappable(result.report, "header-footer")).toMatchObject({
+      count: 1,
+      entries: ["word/header1.xml"],
+    });
   });
 });
 
@@ -1857,6 +3018,161 @@ describe("Google Drive transport", () => {
     });
   });
 });
+
+const DOCX_NAMESPACES = [
+  'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"',
+  'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"',
+  'xmlns:o="urn:schemas-microsoft-com:office:office"',
+  'xmlns:v="urn:schemas-microsoft-com:vml"',
+  'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"',
+  'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"',
+  'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"',
+  'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"',
+  'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"',
+].join(" ");
+
+function documentXml(body: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?><w:document ${DOCX_NAMESPACES}><w:body>${body}</w:body></w:document>`;
+}
+
+/**
+ * Builds a real DOCX archive in memory. The default parts are the minimum a
+ * Word document needs, so tests can add exactly the one construct they are
+ * about without hand-rolling a package each time.
+ */
+function createDocxArchive(
+  parts: Readonly<Record<string, string | Uint8Array | undefined>> = {},
+): Uint8Array {
+  const defaults: Record<string, string | Uint8Array> = {
+    "[Content_Types].xml": [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+      '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml" />',
+      '<Default Extension="xml" ContentType="application/xml" />',
+      '<Default Extension="png" ContentType="image/png" />',
+      '<Default Extension="bin" ContentType="application/vnd.openxmlformats-officedocument.oleObject" />',
+      '<Default Extension="html" ContentType="text/html" />',
+      '<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml" />',
+      '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml" />',
+      '<Override PartName="/word/comments.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml" />',
+      "</Types>",
+    ].join(""),
+    "_rels/.rels": [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+      '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml" />',
+      "</Relationships>",
+    ].join(""),
+    "word/_rels/document.xml.rels": [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+      '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="comments.xml" />',
+      '<Relationship Id="rId100" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png" />',
+      '<Relationship Id="rId101" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="embeddings/oleObject1.bin" />',
+      '<Relationship Id="rId50" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml" />',
+      '<Relationship Id="rId60" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="diagrams/data1.xml" />',
+      '<Relationship Id="rId61" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml" />',
+      '<Relationship Id="rId62" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/aFChunk" Target="afchunk.html" />',
+      "</Relationships>",
+    ].join(""),
+    "word/document.xml": documentXml("<w:p><w:r><w:t>Plain text.</w:t></w:r></w:p>"),
+  };
+  const files: Record<string, Uint8Array> = {};
+
+  for (const [name, content] of Object.entries({ ...defaults, ...parts })) {
+    // An explicit undefined removes a default part, so a test can build an
+    // archive that deliberately lacks one.
+    if (content !== undefined) {
+      files[name] = typeof content === "string" ? strToU8(content) : content;
+    }
+  }
+
+  return zipSync(files);
+}
+
+/**
+ * A well-formed, highly repetitive XML part of at least `minimumBytes`.
+ *
+ * The archive-limit tests have to hand the inspector real, honestly declared
+ * data to be worth anything, so their fixtures are sized from the limit they
+ * probe rather than from a hardcoded number. That keeps them minimal — building
+ * one is dominated by deflating the bytes, so 4x more data is 4x the runtime —
+ * and keeps them correct if a limit is ever retuned.
+ */
+function createRepetitiveXmlPart(minimumBytes: number): Uint8Array {
+  const unit = "<w:p><w:r><w:t>Header padding text.</w:t></w:r></w:p>";
+  const open = '<w:hdr xmlns:w="urn:w">';
+  const close = "</w:hdr>";
+  const repeats = Math.ceil((minimumBytes - open.length - close.length) / unit.length);
+
+  return strToU8(`${open}${unit.repeat(Math.max(repeats, 1))}${close}`);
+}
+
+/** A DOCX containing one of every construct the import report knows about. */
+function createKitchenSinkDocx(): Uint8Array {
+  return createDocxArchive({
+    "word/document.xml": documentXml(
+      [
+        "<w:p>",
+        '<w:r><w:t xml:space="preserve">Base paragraph. </w:t></w:r>',
+        '<w:ins w:id="501" w:author="Reviewer One" w:date="2024-01-01T00:00:00Z"><w:r><w:t>INSERTED-TEXT</w:t></w:r></w:ins>',
+        '<w:del w:id="502" w:author="Reviewer One" w:date="2024-01-01T00:00:00Z"><w:r><w:delText>DELETED-TEXT</w:delText></w:r></w:del>',
+        "</w:p>",
+        "<w:p>",
+        '<w:commentRangeStart w:id="1" /><w:r><w:t>Commented sentence.</w:t></w:r><w:commentRangeEnd w:id="1" />',
+        '<w:r><w:commentReference w:id="1" /></w:r>',
+        "</w:p>",
+        "<w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>TEXTBOX-CONTENT</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>",
+        '<w:p><w:r><w:drawing><wp:inline><wp:extent cx="952500" cy="952500" /><wp:docPr id="1" name="Picture 1" /><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="0" name="image1.png" /><pic:cNvPicPr /></pic:nvPicPr><pic:blipFill><a:blip r:embed="rId100" /><a:stretch><a:fillRect /></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0" /><a:ext cx="952500" cy="952500" /></a:xfrm><a:prstGeom prst="rect"><a:avLst /></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>',
+        '<w:p><w:r><w:object><v:shape id="_x0000_i1025" type="#_x0000_t75" /><o:OLEObject Type="Embed" ProgID="Excel.Sheet.12" ShapeID="_x0000_i1025" DrawAspect="Content" ObjectID="_1" r:id="rId101" /></w:object></w:r></w:p>',
+        '<w:p><w:r><w:drawing><wp:inline><wp:extent cx="2000000" cy="2000000" /><wp:docPr id="20" name="Diagram" /><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" r:dm="rId60" /></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>',
+        '<w:p><w:r><w:drawing><wp:inline><wp:extent cx="2000000" cy="2000000" /><wp:docPr id="21" name="Chart" /><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId61" /></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>',
+        '<w:altChunk r:id="rId62" />',
+        "<w:p><w:r><w:t>Trailing paragraph.</w:t></w:r></w:p>",
+      ].join(""),
+    ),
+    "word/comments.xml": [
+      `<?xml version="1.0" encoding="UTF-8"?><w:comments ${DOCX_NAMESPACES}>`,
+      '<w:comment w:id="1" w:author="Reviewer One" w:date="2024-01-01T00:00:00Z" w:initials="R1">',
+      "<w:p><w:r><w:t>First reviewer comment.</w:t></w:r></w:p></w:comment>",
+      "</w:comments>",
+    ].join(""),
+    "word/header1.xml": `<w:hdr ${DOCX_NAMESPACES}><w:p><w:r><w:t>HEADER-TEXT-CONTENT</w:t></w:r></w:p></w:hdr>`,
+    "word/diagrams/data1.xml":
+      '<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><dgm:ptLst><dgm:pt modelId="1"><dgm:t><a:p><a:r><a:t>SMARTART-NODE-TEXT</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>',
+    "word/charts/chart1.xml":
+      '<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>CHART-TITLE-TEXT</a:t></a:r></a:p></c:rich></c:tx></c:title></c:chart></c:chartSpace>',
+    "word/afchunk.html": "<html><body><p>ALTCHUNK-IMPORTED-TEXT</p></body></html>",
+    "word/media/image1.png": TINY_PNG,
+    "word/embeddings/oleObject1.bin": strToU8("EMBEDDED-OLE-OBJECT"),
+  });
+}
+
+function findUnmappable(
+  report: DocxImportReport,
+  kind: DocxUnmappableKind,
+): DocxUnmappableItem | undefined {
+  return report.unmappable.find((item) => item.kind === kind);
+}
+
+/** A runner that answers the version probe, then writes fixed Markdown output. */
+function createReverseRunner(markdown: string): PandocRunner {
+  return vi.fn(async (_binary, args) => {
+    if (args[0] === "--version") {
+      return { stdout: "pandoc 3.10", stderr: "", exitCode: 0 };
+    }
+
+    const outputPath = args[args.indexOf("--output") + 1];
+
+    if (outputPath === undefined) {
+      throw new Error("test runner received no output path");
+    }
+
+    await writeFile(outputPath, markdown);
+
+    return { stdout: "", stderr: "", exitCode: 0 };
+  });
+}
 
 async function createTempDocx(name: string): Promise<string> {
   const tempDirectory = await createTempDirectory();

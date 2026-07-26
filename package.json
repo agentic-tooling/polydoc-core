@@ -52,7 +52,6 @@
     "@biomejs/biome": "^2.5.5",
     "@types/node": "^20.19.43",
     "@vitest/coverage-v8": "^4.1.10",
-    "fflate": "^0.8.3",
     "google-auth-library": "10.5.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
@@ -60,7 +59,8 @@
   "dependencies": {
     "@azure/msal-node": "5.4.2",
     "@googleapis/drive": "20.2.0",
-    "execa": "^8.0.1"
+    "execa": "^8.0.1",
+    "fflate": "0.8.3"
   },
   "peerDependencies": {
     "google-auth-library": "^10"
