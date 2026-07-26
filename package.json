@@ -46,6 +46,9 @@
     "format": "biome format --write .",
     "format:check": "biome format .",
     "check": "biome check . && tsc -p tsconfig.json --noEmit && vitest run && tsc -p tsconfig.build.json",
+    "changelog": "git cliff -o CHANGELOG.md",
+    "changelog:preview": "git cliff --unreleased",
+    "changelog:release": "git cliff --unreleased --prepend CHANGELOG.md",
     "prepack": "pnpm build"
   },
   "devDependencies": {
