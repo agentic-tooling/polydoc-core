@@ -855,18 +855,13 @@ describe("DOCX import report", () => {
   });
 
   it("refuses to inflate an oversized part instead of exhausting memory", () => {
-    // A ~300 KB archive whose main part inflates to ~93 MB: a ratio near 300:1.
-    // Without the cap this allocated 242 MB of resident memory in 545 ms, and
-    // the cost scales linearly with the input.
+    // A small archive whose main part inflates past the per-part cap: a
+    // compression ratio near 300:1. Without the cap an earlier build of this
+    // shape allocated 242 MB of resident memory in 545 ms, scaling linearly
+    // with the input. Sized just over the cap so the fixture stays cheap.
     const bomb = zipSync(
-      {
-        "word/document.xml": strToU8(
-          `<w:document xmlns:w="urn:w"><w:body>${"<w:p><w:r><w:t>AAAAAAAAAAAAAAAAAAAAAAAA</w:t></w:r></w:p>".repeat(
-            1_200_000,
-          )}</w:body></w:document>`,
-        ),
-      },
-      { level: 9 },
+      { "word/document.xml": createRepetitiveXmlPart(DOCX_MAX_PART_BYTES + 1024) },
+      { level: 1 },
     );
 
     expect(bomb.byteLength).toBeLessThan(2 * 1024 * 1024);
@@ -877,40 +872,46 @@ describe("DOCX import report", () => {
         message: expect.stringContaining("over the"),
       }),
     );
-  });
+  }, 30_000);
 
   it("refuses many individually plausible parts that exceed the total budget", () => {
     // The shape neither other limit catches: every part is honestly declared
     // and comfortably under the per-part cap, and the entry count is modest,
-    // but the aggregate is gigabytes. Enumerating header parts is what removed
-    // the fixed-part-set invariant that used to make the per-part cap an
-    // aggregate cap, so this is the test that holds the budget in place.
-    const part = strToU8(
-      `<w:hdr xmlns:w="urn:w">${"<w:p><w:r><w:t>Header padding text.</w:t></w:r></w:p>".repeat(
-        200_000,
-      )}</w:hdr>`,
-    );
+    // but the aggregate blows past the budget. Enumerating header parts is
+    // what removed the fixed-part-set invariant that used to make the
+    // per-part cap an aggregate cap, so this is the test that holds the
+    // budget in place.
+    //
+    // The fixture is the least data that can prove that: just over the
+    // budget, spread across the fewest parts, at the cheapest compression
+    // level. It still costs ~1.3s because ~128 MB genuinely has to be
+    // deflated, hence the explicit timeout below rather than silently
+    // sitting near the default.
+    const partCount = 10;
+    const part = createRepetitiveXmlPart(Math.ceil(DOCX_MAX_TOTAL_BYTES / partCount) + 1024);
     const entries: Record<string, Uint8Array> = {
       "word/document.xml": strToU8(documentXml("<w:p />")),
     };
 
-    expect(part.byteLength).toBeLessThan(DOCX_MAX_PART_BYTES);
-
-    for (let index = 1; index <= 40; index += 1) {
+    for (let index = 1; index <= partCount; index += 1) {
       entries[`word/header${index}.xml`] = part;
     }
 
-    const archive = zipSync(entries, { level: 9 });
+    // Every other guard must be satisfied, or this would prove nothing about
+    // the budget specifically.
+    expect(part.byteLength).toBeLessThan(DOCX_MAX_PART_BYTES);
+    expect(partCount).toBeLessThanOrEqual(DOCX_MAX_HEADER_FOOTER_PARTS);
+    expect(Object.keys(entries).length).toBeLessThan(DOCX_MAX_ARCHIVE_ENTRIES);
+    expect(part.byteLength * partCount).toBeGreaterThan(DOCX_MAX_TOTAL_BYTES);
 
-    expect(part.byteLength * 40).toBeGreaterThan(DOCX_MAX_TOTAL_BYTES);
-    expect(() => buildDocxImportReport(archive)).toThrow(
+    expect(() => buildDocxImportReport(zipSync(entries, { level: 1 }))).toThrow(
       expect.objectContaining({
         name: "PandocError",
         code: "DOCX_ARCHIVE_INVALID",
         message: expect.stringContaining("in total"),
       }),
     );
-  });
+  }, 30_000);
 
   it("refuses an implausible number of header and footer parts", () => {
     const entries: Record<string, Uint8Array> = {
@@ -3087,6 +3088,24 @@ function createDocxArchive(
   }
 
   return zipSync(files);
+}
+
+/**
+ * A well-formed, highly repetitive XML part of at least `minimumBytes`.
+ *
+ * The archive-limit tests have to hand the inspector real, honestly declared
+ * data to be worth anything, so their fixtures are sized from the limit they
+ * probe rather than from a hardcoded number. That keeps them minimal — building
+ * one is dominated by deflating the bytes, so 4x more data is 4x the runtime —
+ * and keeps them correct if a limit is ever retuned.
+ */
+function createRepetitiveXmlPart(minimumBytes: number): Uint8Array {
+  const unit = "<w:p><w:r><w:t>Header padding text.</w:t></w:r></w:p>";
+  const open = '<w:hdr xmlns:w="urn:w">';
+  const close = "</w:hdr>";
+  const repeats = Math.ceil((minimumBytes - open.length - close.length) / unit.length);
+
+  return strToU8(`${open}${unit.repeat(Math.max(repeats, 1))}${close}`);
 }
 
 /** A DOCX containing one of every construct the import report knows about. */
