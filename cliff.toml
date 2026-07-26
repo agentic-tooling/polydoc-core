@@ -1,0 +1,74 @@
+# Changelog generation. See https://git-cliff.org
+#
+# Regenerating: `pnpm changelog` rewrites the file from git history. Anything
+# that cannot be derived from a commit subject — dependency moves, API-shape
+# notes — lives in the release entry and would be lost. Once 0.1.0 is tagged,
+# prefer `pnpm changelog:release` (`--unreleased --prepend`), which adds the new
+# entry and leaves published ones untouched.
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+Entries are generated from [Conventional Commits](https://www.conventionalcommits.org/)
+by [git-cliff](https://git-cliff.org/). Changes that a commit subject cannot
+convey — dependency moves, notes about the shape of the public API — are added
+to the release entry by hand. This project follows
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+"""
+body = """
+{% if version %}\
+    ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+    ## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim | upper_first }}
+    {% for commit in commits %}
+        - {% if commit.scope %}**{{ commit.scope }}:** {% endif %}\
+            {{ commit.message | upper_first }}{% if commit.remote.pr_number %} \
+            ([#{{ commit.remote.pr_number }}](https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/pull/{{ commit.remote.pr_number }})){% endif %}\
+    {% endfor %}
+{% endfor %}
+"""
+footer = ""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+
+# GitHub's squash-merge takes the PR title, which drops the conventional prefix
+# when the title lacks one. Normalizing here keeps the commit in the changelog
+# instead of silently filtering it out as unconventional.
+commit_preprocessors = [
+    { pattern = "^Add docx-to-markdown reverse conversion \\(Tier-2\\)", replace = "feat: add docx-to-markdown reverse conversion (Tier-2)" },
+    # Squash subjects carry a trailing "(#N)"; the body template already renders
+    # the PR link, so strip it to avoid printing the number twice.
+    { pattern = "(?m) \\(#[0-9]+\\)$", replace = "" },
+]
+
+commit_parsers = [
+    { message = "^Merge (pull request|branch|remote-tracking)", skip = true },
+    { message = "^feat", group = "Features" },
+    { message = "^fix", group = "Bug Fixes" },
+    { message = "^doc", group = "Documentation" },
+    { message = "^perf", group = "Performance" },
+    { message = "^refactor", group = "Refactoring" },
+    { message = "^style", group = "Styling" },
+    { message = "^test", group = "Testing" },
+    { message = "^chore\\(release\\)", skip = true },
+    { message = "^chore\\(deps\\)", skip = true },
+    { message = "^chore|^ci", group = "Miscellaneous" },
+    { body = ".*security", group = "Security" },
+]
+
+protect_breaking_commits = false
+filter_commits = false
+tag_pattern = "v[0-9].*"
+topo_order = false
+sort_commits = "oldest"

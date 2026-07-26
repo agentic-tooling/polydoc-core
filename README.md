@@ -593,6 +593,29 @@ Build output is emitted to `dist/` with JavaScript, source maps, TypeScript
 declarations, and declaration maps. Published package contents are constrained by
 the `files` allowlist in `package.json`.
 
+## Changelog
+
+Release history is in [CHANGELOG.md](CHANGELOG.md).
+
+Commits follow [Conventional Commits](https://www.conventionalcommits.org/)
+(`feat:`, `fix:`, `docs:`, `refactor:`, `perf:`, `test:`, `chore:`, `ci:`, with
+`!` or a `BREAKING CHANGE:` footer for breaking changes), and entries are
+generated with [git-cliff](https://git-cliff.org/) from `cliff.toml`:
+
+```sh
+pnpm changelog:preview   # show unreleased entries without writing
+pnpm changelog:release   # prepend unreleased entries, leaving published ones intact
+pnpm changelog           # regenerate the whole file from history
+```
+
+Prefer `changelog:release` once a version is published. Dependency moves and
+API-shape notes are added to a release entry by hand and a full regeneration
+discards them.
+
+When squash-merging, keep the conventional prefix in the pull request title —
+GitHub uses that title as the commit subject, and a subject without a prefix is
+filtered out of the changelog.
+
 ## License
 
 MIT (c) 2026 Logan Lindquist Land
