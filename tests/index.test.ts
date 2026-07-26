@@ -7,27 +7,7 @@ import { OAuth2Client } from "google-auth-library";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  applyMarkdownPostprocessors,
-  applyMarkdownPreprocessors,
-  buildDocxImportReport,
-  type ConvertMarkdownToDocxOptions,
-  convertDocxToMarkdown,
-  convertMarkdownToDocx,
-  createSharePointClientSecretAccessTokenProvider,
-  DEFAULT_DOCX_TRACK_CHANGES,
-  DEFAULT_SOURCE_DATE_EPOCH,
-  DOCX_MAX_ARCHIVE_ENTRIES,
-  DOCX_MAX_HEADER_FOOTER_PARTS,
-  DOCX_MAX_PART_BYTES,
-  DOCX_MAX_TOTAL_BYTES,
-  DOCX_MIME_TYPE,
-  DOCX_TRACK_CHANGES_MODES,
-  type DocxImportReport,
-  type DocxUnmappableItem,
-  type DocxUnmappableKind,
   defaultGoogleDocName,
-  doctor,
-  encodeSharePointRelativePath,
   GOOGLE_DOC_MIME_TYPE,
   GOOGLE_DRIVE_DOCX_IMPORT_MAX_BYTES,
   GOOGLE_DRIVE_FILE_SCOPE,
@@ -39,11 +19,36 @@ import {
   GoogleDriveTransportError,
   type GoogleDriveTransportOptions,
   type GoogleDriveUpdateFileParams,
+} from "../src/google.js";
+import {
+  applyMarkdownPostprocessors,
+  applyMarkdownPreprocessors,
+  buildDocxImportReport,
+  type ConvertMarkdownToDocxOptions,
+  convertDocxToMarkdown,
+  convertMarkdownToDocx,
+  DEFAULT_DOCX_TRACK_CHANGES,
+  DEFAULT_SOURCE_DATE_EPOCH,
+  DOCX_MAX_ARCHIVE_ENTRIES,
+  DOCX_MAX_HEADER_FOOTER_PARTS,
+  DOCX_MAX_PART_BYTES,
+  DOCX_MAX_TOTAL_BYTES,
+  DOCX_MIME_TYPE,
+  DOCX_TRACK_CHANGES_MODES,
+  type DocxImportReport,
+  type DocxUnmappableItem,
+  type DocxUnmappableKind,
+  doctor,
   LocalFileTransport,
-  MICROSOFT_GRAPH_DEFAULT_SCOPE,
   PandocError,
   type PandocRunner,
   type PandocRunnerOptions,
+  SUPPORTED_PANDOC_MAJOR,
+} from "../src/index.js";
+import {
+  createSharePointClientSecretAccessTokenProvider,
+  encodeSharePointRelativePath,
+  MICROSOFT_GRAPH_DEFAULT_SCOPE,
   SHAREPOINT_REQUIRED_APPLICATION_PERMISSION,
   SHAREPOINT_SIMPLE_UPLOAD_MAX_BYTES,
   type SharePointAccessTokenProvider,
@@ -51,9 +56,8 @@ import {
   SharePointTransport,
   SharePointTransportError,
   type SharePointTransportOptions,
-  SUPPORTED_PANDOC_MAJOR,
   validateSharePointDocxSize,
-} from "../src/index.js";
+} from "../src/sharepoint.js";
 
 // The only module mock in this suite. GoogleDriveTransport imports
 // @googleapis/drive lazily and memoizes the client it builds, so that path is

@@ -3,7 +3,16 @@ import { ConfidentialClientApplication } from "@azure/msal-node";
 import type { Transport, TransportUploadResult } from "./transport.js";
 import { DOCX_MIME_TYPE, TransportError, type TransportErrorCode } from "./transport.js";
 
-export { DOCX_MIME_TYPE };
+/**
+ * The shared transport contract is re-exported here so a consumer that only
+ * imports this entry point can type a `Transport` and catch a `TransportError`
+ * without also importing the root barrel. These are re-exports of the same
+ * bindings the barrel exposes, not copies: both entry points resolve to one
+ * `dist/transport.js` module instance, so `instanceof TransportError` holds
+ * across entry points.
+ */
+export type { Transport, TransportErrorCode, TransportUploadResult } from "./transport.js";
+export { DOCX_MIME_TYPE, TransportError } from "./transport.js";
 
 export const MICROSOFT_GRAPH_DEFAULT_SCOPE = "https://graph.microsoft.com/.default";
 export const SHAREPOINT_REQUIRED_APPLICATION_PERMISSION = "Sites.Selected";

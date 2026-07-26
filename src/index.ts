@@ -1,3 +1,20 @@
+/**
+ * Root entry point: conversion core, the transport contract, and the local file
+ * transport.
+ *
+ * This barrel deliberately pulls in no third-party SDK. Its whole dependency
+ * closure is Node builtins plus `execa` and `fflate`, so a consumer that only
+ * converts Markdown to DOCX never loads a cloud SDK. The cloud transports live
+ * behind their own entry points and are opt-in:
+ *
+ * - `@agentic-tooling/polydoc-core/sharepoint` — `SharePointTransport`
+ * - `@agentic-tooling/polydoc-core/google` — `GoogleDriveTransport`
+ *
+ * Both re-export the shared transport contract, so a consumer of one transport
+ * never has to reach back into this barrel for the types it needs. Adding a
+ * cloud transport export here would undo the split; `tests/entrypoints.test.ts`
+ * fails if the built barrel regains an SDK dependency.
+ */
 export type {
   DocxImportReport,
   DocxTrackChangesMode,
@@ -15,31 +32,6 @@ export {
   DOCX_MAX_TOTAL_BYTES,
   DOCX_TRACK_CHANGES_MODES,
 } from "./docx.js";
-export type {
-  GoogleDriveAuthClient,
-  GoogleDriveCreateFileParams,
-  GoogleDriveExistingFileIdResolver,
-  GoogleDriveFileMetadata,
-  GoogleDriveFileResponse,
-  GoogleDriveFilesClient,
-  GoogleDriveMediaBody,
-  GoogleDriveNameMapper,
-  GoogleDriveTransportDestination,
-  GoogleDriveTransportErrorCode,
-  GoogleDriveTransportErrorContext,
-  GoogleDriveTransportOptions,
-  GoogleDriveTransportOptionsBase,
-  GoogleDriveUpdateFileParams,
-} from "./google.js";
-export {
-  defaultGoogleDocName,
-  GOOGLE_DOC_MIME_TYPE,
-  GOOGLE_DRIVE_DOCX_IMPORT_MAX_BYTES,
-  GOOGLE_DRIVE_FILE_SCOPE,
-  GoogleDriveTransport,
-  GoogleDriveTransportError,
-  validateGoogleDriveDocxSize,
-} from "./google.js";
 export type {
   ConvertDocxToMarkdownOptions,
   ConvertMarkdownToDocxOptions,
@@ -70,31 +62,6 @@ export {
   SUPPORTED_PANDOC_MAJOR,
 } from "./pandoc.js";
 export type {
-  SharePointAccessTokenProvider,
-  SharePointAccessTokenRequest,
-  SharePointClientSecretAccessTokenProviderOptions,
-  SharePointClientSecretCredentials,
-  SharePointConfidentialClient,
-  SharePointDestinationMapper,
-  SharePointTransportDestination,
-  SharePointTransportErrorCode,
-  SharePointTransportErrorContext,
-  SharePointTransportOptions,
-  SharePointTransportOptionsBase,
-} from "./sharepoint.js";
-export {
-  createSharePointClientSecretAccessTokenProvider,
-  DOCX_MIME_TYPE,
-  encodeSharePointRelativePath,
-  MICROSOFT_GRAPH_DEFAULT_SCOPE,
-  MICROSOFT_GRAPH_V1_BASE_URL,
-  SHAREPOINT_REQUIRED_APPLICATION_PERMISSION,
-  SHAREPOINT_SIMPLE_UPLOAD_MAX_BYTES,
-  SharePointTransport,
-  SharePointTransportError,
-  validateSharePointDocxSize,
-} from "./sharepoint.js";
-export type {
   LocalFileDestinationMapper,
   LocalFileTransportDestination,
   LocalFileTransportOptions,
@@ -102,4 +69,4 @@ export type {
   TransportErrorCode,
   TransportUploadResult,
 } from "./transport.js";
-export { LocalFileTransport, TransportError } from "./transport.js";
+export { DOCX_MIME_TYPE, LocalFileTransport, TransportError } from "./transport.js";

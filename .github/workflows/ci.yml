@@ -56,6 +56,24 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # Packaging breakage — an unresolvable subpath, a missing types target —
+      # is invisible to lint, typecheck, and the test suite, and only surfaces
+      # for a consumer after publish. attw resolves every entry point the way
+      # node10, node16, and bundlers would; publint checks the manifest itself.
+      #
+      # This step is the only thing that can verify the node10 rows: TypeScript 7
+      # removed `moduleResolution: node10` (TS5108), so the repo's own compiler
+      # cannot express the scenario `typesVersions` exists to serve. Dropping
+      # this step would make that block unverifiable in-repo.
+      #
+      # `cjs-resolves-to-esm` is ignored because it is inherent to an ESM-only
+      # package, not a defect — and it fired before the `default` conditions
+      # existed, so reverting those would not retire the flag. Do not swap it for
+      # `--profile esm-only`: that profile suppresses whole resolution modes,
+      # including node10, and would report green on unresolvable subpath types.
+      - name: Check package publishing metadata
+        run: pnpm check:package
+
   pandoc-integration:
     name: Pandoc Integration
     runs-on: ubuntu-latest
