@@ -28,34 +28,59 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    }
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./google": {
+      "types": "./dist/google.d.ts",
+      "import": "./dist/google.js",
+      "default": "./dist/google.js"
+    },
+    "./sharepoint": {
+      "types": "./dist/sharepoint.d.ts",
+      "import": "./dist/sharepoint.js",
+      "default": "./dist/sharepoint.js"
+    },
+    "./package.json": "./package.json"
   },
   "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "google": [
+        "./dist/google.d.ts"
+      ],
+      "sharepoint": [
+        "./dist/sharepoint.d.ts"
+      ]
+    }
+  },
   "files": [
     "dist",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "biome check .",
     "format": "biome format --write .",
     "format:check": "biome format .",
-    "check": "biome check . && tsc -p tsconfig.json --noEmit && vitest run && tsc -p tsconfig.build.json",
+    "check:package": "pnpm build && attw --pack . --ignore-rules cjs-resolves-to-esm && publint --strict",
+    "check": "biome check . && tsc -p tsconfig.json --noEmit && vitest run && pnpm check:package",
     "changelog": "git cliff -o CHANGELOG.md",
     "changelog:preview": "git cliff --unreleased",
     "changelog:release": "git cliff --unreleased --prepend CHANGELOG.md",
     "prepack": "pnpm build"
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
     "@biomejs/biome": "^2.5.5",
     "@types/node": "^20.19.43",
     "@vitest/coverage-v8": "^4.1.10",
     "google-auth-library": "10.5.0",
+    "publint": "^0.3.22",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   },

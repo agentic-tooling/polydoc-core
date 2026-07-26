@@ -13,10 +13,58 @@ experience, remote service integrations, and sidecar storage stay outside this
 repository. The library does include the shared transport contract and a local
 file transport for consumers that need deterministic DOCX writes.
 
+## Entry Points
+
+The package is ESM-only and publishes three entry points. Cloud transports are
+opt-in: importing the root entry point never loads a cloud SDK.
+
+| Entry point                                | Contents                                                                              | Third-party load                            |
+| ------------------------------------------ | ------------------------------------------------------------------------------------- | ------------------------------------------- |
+| `@agentic-tooling/polydoc-core`            | Conversion core, the `Transport` contract, `TransportError`, and `LocalFileTransport` | `execa` and `fflate` only                   |
+| `@agentic-tooling/polydoc-core/sharepoint` | `SharePointTransport` and its auth helpers                                            | `@azure/msal-node`                          |
+| `@agentic-tooling/polydoc-core/google`     | `GoogleDriveTransport` and its Drive helpers                                          | `@googleapis/drive`, loaded on first upload |
+
+A consumer doing pure Markdown-to-DOCX conversion should never pay to load a
+SharePoint or Drive SDK it will not call, so the transports live behind their
+own entry points rather than in the root barrel. The difference is measurable
+and enforced: importing the root entry point loads a small fraction of the
+modules it did when the cloud transports were part of the barrel, and the test
+suite fails if the root entry point regains an SDK dependency — including a
+type-only one, and including one behind a lazy `import()`.
+
+Both transport entry points re-export the shared contract — `Transport`,
+`TransportUploadResult`, `TransportError`, `TransportErrorCode`, and
+`DOCX_MIME_TYPE` — so code that imports one transport never has to reach back
+into the root entry point for the error type it needs to catch. These are
+re-exports of the same bindings rather than copies. Under Node's resolver every
+entry point resolves to a single `transport.js` module instance, so
+`instanceof TransportError` holds for a `SharePointTransportError` or
+`GoogleDriveTransportError` no matter which entry point it was imported from —
+`require()` included, on Node versions that can require ESM.
+
+That guarantee comes from module identity, and a build step can break it. If a
+bundler emits the root entry point and a transport entry point into separate
+bundles with no shared chunk — two independent Rollup builds, or a framework
+that splits server and client graphs — a consumer ends up with two distinct
+`TransportError` classes and `instanceof` silently evaluates false, letting the
+error escape the handler. Where that is a possibility, branch on the error code,
+which is stable and resolution-independent:
+
+```ts
+try {
+  await transport.upload(canonicalId, docx);
+} catch (error) {
+  if (error instanceof Error && "code" in error && error.code === "SHAREPOINT_AUTH_FAILED") {
+    // Handle it without depending on which module instance built the error.
+  }
+
+  throw error;
+}
+```
+
 ## API
 
-The package is ESM-only and exports the core Pandoc contract from
-`@agentic-tooling/polydoc-core`.
+The root entry point exports the core Pandoc contract.
 
 ```ts
 import {
@@ -50,7 +98,10 @@ library.
 ## Transports
 
 Transports are side-effecting adapters that publish DOCX bytes for a canonical
-document ID and return a stable destination handle for later consumers.
+document ID and return a stable destination handle for later consumers. The
+contract and `LocalFileTransport` live in the root entry point; the two cloud
+transports are imported from `@agentic-tooling/polydoc-core/sharepoint` and
+`@agentic-tooling/polydoc-core/google`.
 
 ```ts
 import {
@@ -101,10 +152,8 @@ Microsoft Graph app-only auth. It implements the same create-or-update
 `Transport.upload(canonicalId, docx)` contract as `LocalFileTransport`.
 
 ```ts
-import {
-  SharePointTransport,
-  convertMarkdownToDocx,
-} from "@agentic-tooling/polydoc-core";
+import { convertMarkdownToDocx } from "@agentic-tooling/polydoc-core";
+import { SharePointTransport } from "@agentic-tooling/polydoc-core/sharepoint";
 
 const docx = await convertMarkdownToDocx({
   markdown,
@@ -129,8 +178,10 @@ console.log(destination.webUrl); // optional Graph driveItem webUrl
 ```
 
 Auth uses `@azure/msal-node` with the Microsoft Graph scope
-`https://graph.microsoft.com/.default`. `Sites.Selected` is the required Entra
-application permission to admin-consent on the app registration, and a separate
+`https://graph.microsoft.com/.default`. The SDK is a static import here, which is
+why this is a separate entry point: importing `@agentic-tooling/polydoc-core`
+loads no part of it. `Sites.Selected` is the required Entra application
+permission to admin-consent on the app registration, and a separate
 site-specific `write` grant must be provisioned out of band. The library does
 not request `Sites.Selected` as an OAuth scope, does not require
 tenant-wide `Sites.ReadWrite.All`, does not provision site grants, and does not
@@ -206,11 +257,11 @@ contract as the other transports.
 
 ```ts
 import { OAuth2Client } from "google-auth-library";
+import { convertMarkdownToDocx } from "@agentic-tooling/polydoc-core";
 import {
   GOOGLE_DRIVE_FILE_SCOPE,
   GoogleDriveTransport,
-  convertMarkdownToDocx,
-} from "@agentic-tooling/polydoc-core";
+} from "@agentic-tooling/polydoc-core/google";
 
 const docx = await convertMarkdownToDocx({
   markdown,
@@ -256,8 +307,9 @@ one, is your responsibility. Consumers that use a service account, workload
 identity federation, or their own token cache can pass any auth client the Drive
 v3 client accepts.
 
-The `@googleapis/drive` SDK is imported lazily on the first upload, so consumers
-that only use another transport never pay to load it.
+The `@googleapis/drive` SDK is imported lazily on the first upload, so even
+importing this entry point costs nothing until a document is published.
+Consumers that only use another transport never import it at all.
 
 Uploads use the Drive v3 files resource:
 
