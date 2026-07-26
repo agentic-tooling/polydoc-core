@@ -1,10 +1,10 @@
 # polydoc-core
 
 `polydoc-core` is the reusable TypeScript library layer for Polydoc: deterministic
-Markdown-to-DOCX conversion plus hook contracts for consumers that need their own
-Markdown transforms. It is intended to be consumed by the standalone `polydoc`
-tool and by TeamWiki workflows that need the same conversion behavior without
-taking on a CLI.
+Markdown-to-DOCX conversion, a reported DOCX-to-Markdown reverse conversion, plus
+hook contracts for consumers that need their own Markdown transforms. It is
+intended to be consumed by the standalone `polydoc` tool and by TeamWiki
+workflows that need the same conversion behavior without taking on a CLI.
 
 The original Polydoc design work scoped a local-first Markdown-to-Word and
 Markdown-to-Google Docs workflow. This package keeps only the reusable library
@@ -365,6 +365,150 @@ The forward DOCX writer intentionally does not pass `--wrap=none` or
 `--markdown-headings=atx`; those Pandoc options affect textual Markdown output,
 not DOCX generation.
 
+## Reverse Conversion
+
+`convertDocxToMarkdown()` converts a Word document back into clean
+GitHub-Flavored Markdown, and reports what it could not bring with it.
+
+```ts
+import { convertDocxToMarkdown } from "@agentic-tooling/polydoc-core";
+
+const { markdown, report } = await convertDocxToMarkdown({
+  docx: "./out/word/handbook-intro.docx", // bytes or a path
+  postprocessors: [
+    // Restore what the DOCX could not carry, from your own sidecar.
+    (source) => {
+      let restored = source;
+
+      // Note replaceAll: passing a string to replace() rewrites only the first
+      // match. A real sidecar should record source offsets rather than bare
+      // names, because "Handbook" as a wikilink target is indistinguishable
+      // from "Handbook" written as ordinary prose.
+      for (const target of new Set(sidecar.wikilinks)) {
+        restored = restored.replaceAll(target, `[[${target}]]`);
+      }
+
+      return `${sidecar.frontmatter}${restored}`;
+    },
+  ],
+});
+
+if (report.hasUnmappableContent) {
+  for (const item of report.unmappable) {
+    console.warn(`${item.kind} (${item.count}): ${item.summary}`);
+  }
+}
+```
+
+Reverse conversion uses:
+
+```txt
+pandoc --from docx --to gfm --track-changes <mode> --output <output.md> <input.docx>
+```
+
+`trackChanges` defaults to `accept`, which resolves Word revision marks into the
+clean Markdown a reviewed import wants. `reject` restores the pre-edit text, and
+`all` keeps insertions, deletions, and comments as inline HTML spans. The value
+is always passed explicitly rather than relying on Pandoc's default, and the
+resolution is recorded on the report.
+
+Input is validated before Pandoc runs. Bytes that are not a ZIP archive fail
+with `DOCX_INPUT_INVALID`, and a ZIP with no main document part fails with
+`DOCX_ARCHIVE_INVALID`, so a `.doc`, a PDF, or a renamed archive never reaches
+the converter.
+
+Because reverse conversion is the one path that takes bytes from outside, the
+archive reader is bounded in four independent ways. Each raises
+`DOCX_ARCHIVE_INVALID`:
+
+- `DOCX_MAX_TOTAL_BYTES` (128 MB) caps the **total** decompressed across every
+  part read from one archive. This is the bound that actually holds, because the
+  set of parts read is not fixed — headers and footers are enumerated from the
+  archive — so a per-part limit alone is not an aggregate limit.
+- `DOCX_MAX_PART_BYTES` (64 MB) caps any single part. A crafted `.docx` can
+  reach a compression ratio near 300:1.
+- `DOCX_MAX_ARCHIVE_ENTRIES` (4096) caps how many entries are walked, and
+  `DOCX_MAX_HEADER_FOOTER_PARTS` (64) caps header and footer parts specifically.
+- A part whose inflated size disagrees with the size its archive entry declares
+  is rejected rather than analyzed, because the decompressor sizes its output
+  buffer from that declaration and would otherwise hand back a silently
+  truncated fragment — producing a clean report for a document Pandoc reads in
+  full.
+
+The limits are deliberately not configurable. A hardening limit a consumer can
+raise is one that hostile input can argue them into raising.
+
+### The round trip is lossy
+
+`md → docx → md` does not return the note you started with. Pandoc's DOCX reader
+silently discards several kinds of Word content, so this package inspects the
+DOCX archive itself and reports each one. Verified against Pandoc 3.x:
+
+| Report `kind`      | What happens                                                                                                                        |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `tracked-change`   | Insertions and deletions are resolved per `trackChanges`; the revision marks and their authors are gone. Tracked *moves* count as both. Formatting-only revisions are lost in every mode, including `all`. |
+| `comment`          | Word comments are dropped entirely unless `trackChanges` is `all`.                                                                    |
+| `header-footer`    | Headers and footers are ignored entirely, along with anything parked in them.                                                          |
+| `text-box`         | A text box is reached only through the legacy VML representation. One carrying an `mc:Fallback`, which is what Word 2010 and newer writes, is inlined as an ordinary body paragraph — the text survives but the framing and position do not. One without a fallback is dropped along with its text. |
+| `external-content` | `altChunk` imports, which embed another HTML or DOCX document, are ignored.                                                            |
+| `smart-art`        | SmartArt is dropped, including every node label.                                                                                      |
+| `chart`            | Charts are dropped, including titles and axis labels.                                                                                 |
+| `embedded-media`   | Images are referenced by path but their bytes are never written, so the Markdown links dangle.                                        |
+| `embedded-object`  | Embedded OLE objects are dropped with no placeholder.                                                                                 |
+
+Counters run across the main document part plus `footnotes.xml` and
+`endnotes.xml`, whose text does flow into the Markdown; `report.scannedParts`
+names exactly what was inspected. The main document part is resolved from the
+package relationships rather than assumed to be `word/document.xml`.
+
+On top of that, plain Markdown-level detail does not survive a DOCX round trip:
+YAML frontmatter is gone, `[[wikilinks]]` come back as backslash-escaped literal
+text, callout markers are escaped and their internal line breaks are folded, and
+paragraphs are re-wrapped at Pandoc's default column width.
+
+Restoring that layer is the consumer's job, through `postprocessors` and a
+sidecar recorded at publish time. `tests/fixtures/golden/roundtrip/basic-note/`
+records exactly what the round trip produces for the publish fixture.
+
+### What the report does not cover
+
+An empty `report.unmappable` means none of the kinds above were found. It is
+**not** a proof of lossless conversion. Known gaps, by design:
+
+- Page and section layout: manual page breaks, columns, and section properties.
+- Direct formatting with no Markdown equivalent, such as highlighting,
+  character spacing, and colored text.
+- Content in a part outside `report.scannedParts`, including
+  `word/glossary/document.xml`, where Word stores AutoText and building blocks.
+- VML WordArt, whose text lives in a `<v:textpath string="..."/>` attribute
+  rather than in an element, so element counters cannot see it.
+- A header or footer whose content is entirely non-textual. The
+  `header-footer` item fires only when a part contains at least one `w:t`, which
+  keeps empty Word boilerplate out of the report at this cost.
+- An OLE object that is linked rather than embedded, which leaves no
+  `word/embeddings/` part to detect.
+
+Detection is a structural scan of the archive, so a construct Word can produce
+but this library does not know about will not be reported.
+
+### Check the report before writing anything back
+
+**`report.unmappable` must be checked before this Markdown is written over a
+source note.** Every entry is content that exists in the Word document and does
+not exist in the Markdown; writing the result back unreviewed destroys it.
+
+The report is returned, never thrown, and there is deliberately no `strict`
+option. The intended consumer is a review step with a human in the loop, which
+decides what to do — the library will not make that call by refusing to convert.
+A reasonable consumer treats a non-empty `report.unmappable` as a prompt, shows
+the summaries, and only then offers to apply the diff.
+
+Reverse import is Word-only by design. Google Docs is publish-only: a Google
+round trip would go through Drive's own DOCX export on top of Pandoc's DOCX
+reader, which is lossy twice over, so this package does not import, diff, or
+reverse-convert Google Docs. The same applies to SharePoint, which is a
+transport for Word files rather than a second document format.
+
 ## Hooks
 
 Forward conversion accepts Markdown preprocessors:
@@ -382,10 +526,16 @@ const docxBytes = await convertMarkdownToDocx({
 Preprocessors run sequentially before Pandoc receives the Markdown. They receive
 a context object with `phase: "preprocess"` and `targetFormat: "docx"`.
 
-The package also exports `MarkdownPostprocessor` and
-`applyMarkdownPostprocessors()` for future reverse or textual Markdown pipelines.
-They do not run during Markdown-to-DOCX conversion because that pipeline returns
-DOCX bytes, not Markdown text.
+Reverse conversion accepts Markdown postprocessors, which run sequentially over
+the Markdown Pandoc produced and receive a context object with
+`phase: "postprocess"` and `targetFormat: "markdown"`. This is where a consumer
+restores frontmatter, wikilinks, and anything else its sidecar recorded at
+publish time.
+
+Postprocessors do not run during Markdown-to-DOCX conversion, because that
+pipeline returns DOCX bytes rather than Markdown text. `MarkdownPostprocessor`
+and `applyMarkdownPostprocessors()` are also exported directly for consumers
+that want to run the same hooks outside a conversion.
 
 ## Determinism
 

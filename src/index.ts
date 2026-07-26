@@ -1,4 +1,21 @@
 export type {
+  DocxImportReport,
+  DocxTrackChangesMode,
+  DocxTrackedChangeCounts,
+  DocxUnmappableItem,
+  DocxUnmappableKind,
+} from "./docx.js";
+export {
+  buildDocxImportReport,
+  DEFAULT_DOCX_DOCUMENT_PART,
+  DEFAULT_DOCX_TRACK_CHANGES,
+  DOCX_MAX_ARCHIVE_ENTRIES,
+  DOCX_MAX_HEADER_FOOTER_PARTS,
+  DOCX_MAX_PART_BYTES,
+  DOCX_MAX_TOTAL_BYTES,
+  DOCX_TRACK_CHANGES_MODES,
+} from "./docx.js";
+export type {
   GoogleDriveAuthClient,
   GoogleDriveCreateFileParams,
   GoogleDriveExistingFileIdResolver,
@@ -24,7 +41,9 @@ export {
   validateGoogleDriveDocxSize,
 } from "./google.js";
 export type {
+  ConvertDocxToMarkdownOptions,
   ConvertMarkdownToDocxOptions,
+  DocxToMarkdownResult,
   MarkdownPostprocessor,
   MarkdownPreprocessor,
   MarkdownProcessor,
@@ -43,6 +62,7 @@ export type {
 export {
   applyMarkdownPostprocessors,
   applyMarkdownPreprocessors,
+  convertDocxToMarkdown,
   convertMarkdownToDocx,
   DEFAULT_SOURCE_DATE_EPOCH,
   doctor,

@@ -4,24 +4,18 @@ import { tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import { execa } from "execa";
 
+import type { DocxImportReport, DocxTrackChangesMode } from "./docx.js";
+import { buildDocxImportReport, DEFAULT_DOCX_TRACK_CHANGES } from "./docx.js";
+import type { PandocDoctorFailureCode } from "./errors.js";
+import { PandocError } from "./errors.js";
+
 export const SUPPORTED_PANDOC_MAJOR = 3;
 export const DEFAULT_SOURCE_DATE_EPOCH = "0";
 
 const DEFAULT_PANDOC_BINARY = "pandoc";
 
-export type PandocDoctorFailureCode =
-  | "PANDOC_NOT_FOUND"
-  | "PANDOC_PROBE_FAILED"
-  | "PANDOC_VERSION_UNPARSEABLE"
-  | "PANDOC_UNSUPPORTED_MAJOR";
-
-export type PandocErrorCode =
-  | PandocDoctorFailureCode
-  | "MARKDOWN_HOOK_FAILED"
-  | "PANDOC_CONVERSION_FAILED"
-  | "REFERENCE_DOC_REQUIRED"
-  | "REFERENCE_DOC_INVALID"
-  | "SOURCE_DATE_EPOCH_INVALID";
+export type { PandocDoctorFailureCode, PandocErrorCode } from "./errors.js";
+export { PandocError } from "./errors.js";
 
 export interface PandocVersion {
   readonly major: number;
@@ -90,7 +84,11 @@ export type MarkdownProcessor = (
 export type MarkdownPreprocessor = MarkdownProcessor;
 
 /**
- * Typed contract for future reverse/textual Markdown pipelines.
+ * Typed contract for reverse and textual Markdown pipelines.
+ *
+ * `convertDocxToMarkdown()` runs these over the Markdown Pandoc produced, which
+ * is where a consumer restores the Obsidian layer a DOCX cannot carry, such as
+ * YAML frontmatter and `[[wikilinks]]`, from its own sidecar.
  *
  * Markdown-to-DOCX conversion does not run postprocessors because the forward
  * pipeline returns DOCX bytes, not Markdown text.
@@ -105,28 +103,23 @@ export interface ConvertMarkdownToDocxOptions extends PandocDoctorOptions {
   readonly metadata?: Readonly<Record<string, unknown>>;
 }
 
-export class PandocError extends Error {
-  readonly code: PandocErrorCode;
-  readonly guidance: string;
+export interface ConvertDocxToMarkdownOptions extends PandocDoctorOptions {
+  /** DOCX bytes, or a filesystem path to a `.docx` file to read. */
+  readonly docx: Uint8Array | string;
+  /** How to resolve Word revision marks. Defaults to `accept`. */
+  readonly trackChanges?: DocxTrackChangesMode;
+  readonly postprocessors?: readonly MarkdownPostprocessor[];
+  readonly metadata?: Readonly<Record<string, unknown>>;
+}
 
-  constructor(
-    code: PandocErrorCode,
-    message: string,
-    guidance: string,
-    options: { readonly cause?: unknown } = {},
-  ) {
-    const fullMessage = `${message} ${guidance}`;
-
-    if ("cause" in options) {
-      super(fullMessage, { cause: options.cause });
-    } else {
-      super(fullMessage);
-    }
-
-    this.name = "PandocError";
-    this.code = code;
-    this.guidance = guidance;
-  }
+export interface DocxToMarkdownResult {
+  /** GitHub-Flavored Markdown, after every postprocessor has run. */
+  readonly markdown: string;
+  /**
+   * What the DOCX contained that the Markdown does not. Check
+   * `report.unmappable` before writing this Markdown back over a source note.
+   */
+  readonly report: DocxImportReport;
 }
 
 export async function doctor(options: PandocDoctorOptions = {}): Promise<PandocDoctorResult> {
@@ -289,7 +282,10 @@ export async function convertMarkdownToDocx(
       throw new PandocError(
         "PANDOC_CONVERSION_FAILED",
         "Pandoc failed while converting Markdown to DOCX.",
-        conversionGuidance(result.stderr),
+        conversionGuidance(
+          "Confirm the Markdown input and reference DOCX are valid, then retry.",
+          result.stderr,
+        ),
       );
     }
 
@@ -305,6 +301,141 @@ export async function convertMarkdownToDocx(
     }
   } finally {
     await rm(tempDirectory, { force: true, recursive: true });
+  }
+}
+
+/**
+ * Converts a Word document into clean GitHub-Flavored Markdown.
+ *
+ * The returned report is informational, never thrown: the caller is expected to
+ * be a review step with a human in the loop, so it decides what to do about the
+ * content Pandoc could not carry across. Nothing is silently discarded.
+ */
+export async function convertDocxToMarkdown(
+  options: ConvertDocxToMarkdownOptions,
+): Promise<DocxToMarkdownResult> {
+  // Snapshot before the first await. The report and the bytes handed to Pandoc
+  // must describe the same document, so caller mutation cannot be allowed to
+  // race the conversion.
+  const docxInput = snapshotDocxInput(options.docx);
+  const pandoc = await doctor(options);
+
+  if (!pandoc.ok) {
+    throw pandocFailureToError(pandoc);
+  }
+
+  const docx = await readDocxInput(docxInput);
+  // Fails closed on anything that is not a readable Word document, so Pandoc is
+  // never handed garbage, and inventories the losses before conversion. It also
+  // validates trackChanges, and the argv below uses the mode it echoes back, so
+  // the report cannot disagree with the flag Pandoc actually ran with.
+  const report = buildDocxImportReport(docx, options.trackChanges ?? DEFAULT_DOCX_TRACK_CHANGES);
+  const runner = options.runner ?? defaultPandocRunner;
+  const tempDirectory = await mkdtemp(join(tmpdir(), "polydoc-core-"));
+
+  try {
+    const inputPath = join(tempDirectory, "input.docx");
+    const outputPath = join(tempDirectory, "output.md");
+    await writeFile(inputPath, docx);
+
+    let result: PandocRunnerResult;
+
+    try {
+      result = await runner(
+        pandoc.binary,
+        [
+          "--from",
+          "docx",
+          "--to",
+          "gfm",
+          "--track-changes",
+          report.trackChanges,
+          "--output",
+          outputPath,
+          inputPath,
+        ],
+        { reject: false },
+      );
+    } catch (cause) {
+      if (cause instanceof PandocError) {
+        throw cause;
+      }
+
+      throw new PandocError(
+        "PANDOC_CONVERSION_FAILED",
+        "Pandoc execution failed while converting DOCX to Markdown.",
+        "Confirm pandocPath points at a working Pandoc 3.x binary and retry the conversion.",
+        { cause },
+      );
+    }
+
+    if (result.exitCode !== 0) {
+      throw new PandocError(
+        "PANDOC_CONVERSION_FAILED",
+        "Pandoc failed while converting DOCX to Markdown.",
+        conversionGuidance(
+          "The archive passed DOCX validation, so this is a Pandoc reader failure rather than a malformed file; retry with a Word-generated copy of the document.",
+          result.stderr,
+        ),
+      );
+    }
+
+    let markdown: string;
+
+    try {
+      markdown = await readFile(outputPath, "utf8");
+    } catch (cause) {
+      throw new PandocError(
+        "PANDOC_CONVERSION_FAILED",
+        "Pandoc completed but the Markdown output could not be read.",
+        "Check that the conversion process can write to the system temp directory and that disk space is available.",
+        { cause },
+      );
+    }
+
+    return {
+      markdown: await applyMarkdownPostprocessors(
+        markdown,
+        options.postprocessors,
+        options.metadata,
+      ),
+      report,
+    };
+  } finally {
+    await rm(tempDirectory, { force: true, recursive: true });
+  }
+}
+
+/**
+ * Copies caller-owned DOCX bytes. Anything that is not a `Uint8Array` passes
+ * through untouched so input validation can report it with a typed error.
+ */
+function snapshotDocxInput(docx: Uint8Array | string): Uint8Array | string {
+  return docx instanceof Uint8Array ? docx.slice() : docx;
+}
+
+async function readDocxInput(docx: Uint8Array | string): Promise<Uint8Array> {
+  if (typeof docx !== "string") {
+    return docx;
+  }
+
+  if (docx.trim() === "") {
+    throw new PandocError(
+      "DOCX_INPUT_INVALID",
+      "A DOCX path is required when docx is passed as a string.",
+      "Pass the path to a readable .docx file, or pass the DOCX bytes as a Uint8Array.",
+    );
+  }
+
+  try {
+    return await readFile(docx);
+  } catch (cause) {
+    throw new PandocError(
+      "DOCX_INPUT_INVALID",
+      `The DOCX file ${basename(docx)} could not be read.`,
+      "Pass the path to a readable .docx file, or pass the DOCX bytes as a Uint8Array.",
+      { cause },
+    );
   }
 }
 
@@ -484,11 +615,12 @@ function joinOutput(stdout: string, stderr: string): string {
   return [stdout, stderr].filter((text) => text.length > 0).join("\n");
 }
 
-function conversionGuidance(stderr: string): string {
+/** Appends bounded Pandoc stderr to direction-specific guidance. */
+function conversionGuidance(advice: string, stderr: string): string {
   const trimmed = stderr.trim();
   const stderrSuffix = trimmed.length > 0 ? ` Pandoc stderr: ${trimmed.slice(0, 800)}` : "";
 
-  return `Confirm the Markdown input and reference DOCX are valid, then retry.${stderrSuffix}`;
+  return `${advice}${stderrSuffix}`;
 }
 
 function isNotFoundError(error: unknown): boolean {
