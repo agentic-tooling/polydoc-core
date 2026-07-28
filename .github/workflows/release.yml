@@ -144,11 +144,27 @@ jobs:
       # Pack once, then validate and publish that exact file. Packing runs
       # prepack (a clean rebuild), so validating the directory and then
       # publishing it would validate one build and ship a different one.
+      #
+      # The build is explicit and pack runs with --ignore-scripts rather than
+      # letting prepack fire, and the filename is derived from the manifest
+      # rather than read from stdout: `npm pack --silent` still prints the
+      # lifecycle banner, so capturing its output yields a multi-line string
+      # that cannot be written to $GITHUB_OUTPUT.
       - name: Pack
         id: pack
         run: |
           set -euo pipefail
-          tarball="$(npm pack --silent)"
+          pnpm build
+          npm pack --ignore-scripts --silent > /dev/null
+
+          tarball="$(node -p "const p = require('./package.json'); \`\${p.name.replace('@', '').replace('/', '-')}-\${p.version}.tgz\`")"
+
+          if [ ! -f "$tarball" ]; then
+            echo "::error::Expected packed tarball ${tarball} was not produced."
+            ls -1 ./*.tgz || true
+            exit 1
+          fi
+
           echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
           echo "Packed ${tarball}."
 
