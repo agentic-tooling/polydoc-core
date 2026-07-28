@@ -4,7 +4,7 @@
  *
  *     node tests/support/entrypoint-probe.mjs <specifier> <recordPath>
  *
- * The specifier is the public one — `@agentic-tooling/polydoc-core/google`, not
+ * The specifier is the public one — `@llbbl/polydoc-core/google`, not
  * a guessed `dist/` path — so the probe exercises the package.json `exports`
  * map through Node's own resolver by self-reference. A typo in an export key or
  * target fails here the same way it would fail for a consumer after publish.

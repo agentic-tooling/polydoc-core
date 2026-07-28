@@ -20,9 +20,9 @@ opt-in: importing the root entry point never loads a cloud SDK.
 
 | Entry point                                | Contents                                                                              | Third-party load                            |
 | ------------------------------------------ | ------------------------------------------------------------------------------------- | ------------------------------------------- |
-| `@agentic-tooling/polydoc-core`            | Conversion core, the `Transport` contract, `TransportError`, and `LocalFileTransport` | `execa` and `fflate` only                   |
-| `@agentic-tooling/polydoc-core/sharepoint` | `SharePointTransport` and its auth helpers                                            | `@azure/msal-node`                          |
-| `@agentic-tooling/polydoc-core/google`     | `GoogleDriveTransport` and its Drive helpers                                          | `@googleapis/drive`, loaded on first upload |
+| `@llbbl/polydoc-core`            | Conversion core, the `Transport` contract, `TransportError`, and `LocalFileTransport` | `execa` and `fflate` only                   |
+| `@llbbl/polydoc-core/sharepoint` | `SharePointTransport` and its auth helpers                                            | `@azure/msal-node`                          |
+| `@llbbl/polydoc-core/google`     | `GoogleDriveTransport` and its Drive helpers                                          | `@googleapis/drive`, loaded on first upload |
 
 A consumer doing pure Markdown-to-DOCX conversion should never pay to load a
 SharePoint or Drive SDK it will not call, so the transports live behind their
@@ -71,7 +71,7 @@ import {
   SUPPORTED_PANDOC_MAJOR,
   convertMarkdownToDocx,
   doctor,
-} from "@agentic-tooling/polydoc-core";
+} from "@llbbl/polydoc-core";
 
 const probe = await doctor();
 
@@ -100,14 +100,14 @@ library.
 Transports are side-effecting adapters that publish DOCX bytes for a canonical
 document ID and return a stable destination handle for later consumers. The
 contract and `LocalFileTransport` live in the root entry point; the two cloud
-transports are imported from `@agentic-tooling/polydoc-core/sharepoint` and
-`@agentic-tooling/polydoc-core/google`.
+transports are imported from `@llbbl/polydoc-core/sharepoint` and
+`@llbbl/polydoc-core/google`.
 
 ```ts
 import {
   LocalFileTransport,
   convertMarkdownToDocx,
-} from "@agentic-tooling/polydoc-core";
+} from "@llbbl/polydoc-core";
 
 const docx = await convertMarkdownToDocx({
   markdown,
@@ -152,8 +152,8 @@ Microsoft Graph app-only auth. It implements the same create-or-update
 `Transport.upload(canonicalId, docx)` contract as `LocalFileTransport`.
 
 ```ts
-import { convertMarkdownToDocx } from "@agentic-tooling/polydoc-core";
-import { SharePointTransport } from "@agentic-tooling/polydoc-core/sharepoint";
+import { convertMarkdownToDocx } from "@llbbl/polydoc-core";
+import { SharePointTransport } from "@llbbl/polydoc-core/sharepoint";
 
 const docx = await convertMarkdownToDocx({
   markdown,
@@ -179,7 +179,7 @@ console.log(destination.webUrl); // optional Graph driveItem webUrl
 
 Auth uses `@azure/msal-node` with the Microsoft Graph scope
 `https://graph.microsoft.com/.default`. The SDK is a static import here, which is
-why this is a separate entry point: importing `@agentic-tooling/polydoc-core`
+why this is a separate entry point: importing `@llbbl/polydoc-core`
 loads no part of it. `Sites.Selected` is the required Entra application
 permission to admin-consent on the app registration, and a separate
 site-specific `write` grant must be provisioned out of band. The library does
@@ -257,11 +257,11 @@ contract as the other transports.
 
 ```ts
 import { OAuth2Client } from "google-auth-library";
-import { convertMarkdownToDocx } from "@agentic-tooling/polydoc-core";
+import { convertMarkdownToDocx } from "@llbbl/polydoc-core";
 import {
   GOOGLE_DRIVE_FILE_SCOPE,
   GoogleDriveTransport,
-} from "@agentic-tooling/polydoc-core/google";
+} from "@llbbl/polydoc-core/google";
 
 const docx = await convertMarkdownToDocx({
   markdown,
@@ -423,7 +423,7 @@ not DOCX generation.
 GitHub-Flavored Markdown, and reports what it could not bring with it.
 
 ```ts
-import { convertDocxToMarkdown } from "@agentic-tooling/polydoc-core";
+import { convertDocxToMarkdown } from "@llbbl/polydoc-core";
 
 const { markdown, report } = await convertDocxToMarkdown({
   docx: "./out/word/handbook-intro.docx", // bytes or a path

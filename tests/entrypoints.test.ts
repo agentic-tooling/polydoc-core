@@ -23,7 +23,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const distDir = join(repoRoot, "dist");
 const supportDir = join(repoRoot, "tests", "support");
 
-const PACKAGE_NAME = "@agentic-tooling/polydoc-core";
+const PACKAGE_NAME = "@llbbl/polydoc-core";
 
 /**
  * Every third-party package the root entry point may load. This list is the
