@@ -8,7 +8,7 @@ convey — dependency moves, notes about the shape of the public API — are add
 to the release entry by hand. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - 2026-07-26
+## [0.1.0] - 2026-07-28
 
 ### Features
 
@@ -38,8 +38,8 @@ to the release entry by hand. This project follows
 ### Notes
 
 - The transports are subpath-only. `SharePointTransport` is imported from
-  `@agentic-tooling/polydoc-core/sharepoint` and `GoogleDriveTransport` from
-  `@agentic-tooling/polydoc-core/google`; neither is re-exported from the root
+  `@llbbl/polydoc-core/sharepoint` and `GoogleDriveTransport` from
+  `@llbbl/polydoc-core/google`; neither is re-exported from the root
   entry point, types included. The root entry point loads no third-party SDK —
   Node builtins plus `execa` and `fflate` — so a Markdown-to-DOCX consumer never
   pays for a cloud SDK it will not call. Both transport entry points re-export

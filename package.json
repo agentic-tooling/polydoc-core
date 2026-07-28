@@ -1,6 +1,6 @@
 {
-  "name": "@agentic-tooling/polydoc-core",
-  "version": "0.0.0",
+  "name": "@llbbl/polydoc-core",
+  "version": "0.1.0",
   "description": "Reusable TypeScript Markdown-to-DOCX conversion core for polydoc and TeamWiki.",
   "type": "module",
   "license": "MIT",

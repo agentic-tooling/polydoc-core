@@ -7,8 +7,8 @@
  * converts Markdown to DOCX never loads a cloud SDK. The cloud transports live
  * behind their own entry points and are opt-in:
  *
- * - `@agentic-tooling/polydoc-core/sharepoint` — `SharePointTransport`
- * - `@agentic-tooling/polydoc-core/google` — `GoogleDriveTransport`
+ * - `@llbbl/polydoc-core/sharepoint` — `SharePointTransport`
+ * - `@llbbl/polydoc-core/google` — `GoogleDriveTransport`
  *
  * Both re-export the shared transport contract, so a consumer of one transport
  * never has to reach back into this barrel for the types it needs. Adding a

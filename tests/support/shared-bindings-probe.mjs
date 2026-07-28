@@ -7,9 +7,9 @@
  * same `dist/transport.js` module instance — otherwise `instanceof` would fail
  * across entry points and the duplicate exports would be a real hazard.
  */
-import * as core from "@agentic-tooling/polydoc-core";
-import * as google from "@agentic-tooling/polydoc-core/google";
-import * as sharepoint from "@agentic-tooling/polydoc-core/sharepoint";
+import * as core from "@llbbl/polydoc-core";
+import * as google from "@llbbl/polydoc-core/google";
+import * as sharepoint from "@llbbl/polydoc-core/sharepoint";
 
 const googleError = new google.GoogleDriveTransportError(
   "GOOGLE_DRIVE_API_FAILED",
