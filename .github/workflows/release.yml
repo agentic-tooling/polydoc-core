@@ -1,0 +1,234 @@
+name: Release
+
+# Publishing is driven by pushing a version tag:
+#
+#   npm version <x.y.z> --no-git-tag-version   # or edit package.json
+#   pnpm changelog:release                     # prepend the new entry
+#   git commit -am "chore(release): x.y.z"
+#   git tag vx.y.z && git push origin main --follow-tags
+#
+# The tag is the trigger, but it is not trusted: the job refuses to publish
+# unless the tag, package.json, and CHANGELOG.md all name the same version, and
+# the changelog section for it is non-empty.
+#
+# Both mutating steps are idempotent, so a run that dies between publishing and
+# creating the GitHub Release can simply be re-run. Without that, a transient
+# GitHub error would strand the tag with a published package and a workflow that
+# can never go green.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+# A constant group, not one keyed on the tag: two tags pushed together would
+# otherwise publish concurrently, and whichever landed last would own the
+# `latest` dist-tag regardless of which version is newer.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      # Mints the OIDC token npm exchanges for short-lived publish credentials.
+      # Trusted publishing is configured per-package at
+      # https://www.npmjs.com/package/@llbbl/polydoc-core/access and is pinned to
+      # this repository AND this workflow filename — renaming this file breaks
+      # publishing until the trusted publisher config is updated to match. If
+      # that config ever names a GitHub Environment, this job must declare a
+      # matching `environment:` key or the exchange fails.
+      id-token: write
+      # Needed to create the GitHub Release at the end.
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      # registry-url is required for trusted publishing: it writes the .npmrc
+      # that scopes the credential exchange to the public registry. No
+      # NODE_AUTH_TOKEN is set anywhere — a token here would defeat the point.
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.x
+          registry-url: "https://registry.npmjs.org"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      # setup-node always writes `_authToken=${NODE_AUTH_TOKEN}` into the npmrc.
+      # With the variable unset, npm substitutes the literal string rather than
+      # failing, so it looks like a credential, npm skips its "you need to
+      # authenticate" guidance, and an OIDC failure surfaces as a bare E404.
+      # Dropping the line restores that guidance and also silences a pnpm
+      # warning about the unresolvable variable that reads like a credential
+      # error immediately before the publish step.
+      - name: Drop the placeholder auth line
+        run: |
+          set -euo pipefail
+          if [ -n "${NPM_CONFIG_USERCONFIG:-}" ] && [ -f "$NPM_CONFIG_USERCONFIG" ]; then
+            sed -i '/_authToken/d' "$NPM_CONFIG_USERCONFIG"
+            cat "$NPM_CONFIG_USERCONFIG"
+          fi
+
+      # Trusted publishing needs npm >= 11.5.1, which runners lag behind. Pinned
+      # rather than @latest: this job holds an OIDC identity that can push to the
+      # registry, so the most privileged step in the repo should not install
+      # whatever npm happens to be newest at release time. 11.x is deliberate —
+      # it is the major all current trusted-publishing docs describe. Revisit
+      # once a 12.x OIDC publish has been proven somewhere lower-stakes.
+      - name: Install a pinned npm for trusted publishing
+        run: |
+          npm install -g npm@11.18.0
+          npm --version
+
+      - name: Setup Pandoc
+        uses: pandoc/actions/setup@v1
+        with:
+          version: 3.10.1
+
+      - name: Verify Pandoc
+        run: pandoc --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify tag, package.json, and changelog agree
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(node -p "require('./package.json').version")"
+
+          if [ "$tag_version" != "$package_version" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version ${package_version}."
+            exit 1
+          fi
+
+          # Literal match via awk rather than grep, so the version's dots are not
+          # regex metacharacters and this agrees by construction with the
+          # extraction step below.
+          if ! awk -v heading="## [${package_version}]" '
+            index($0, heading) == 1 { found = 1 }
+            END { exit !found }
+          ' CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${package_version}]' entry."
+            exit 1
+          fi
+
+          echo "Releasing ${package_version}."
+
+      - name: Check formatting
+        run: pnpm format:check
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      # POLYDOC_REQUIRE_PANDOC makes the Pandoc-backed tests fail rather than
+      # skip. A release must never ship on a run where they quietly skipped.
+      - name: Test
+        run: pnpm test
+        env:
+          POLYDOC_REQUIRE_PANDOC: "1"
+
+      # Pack once, then validate and publish that exact file. Packing runs
+      # prepack (a clean rebuild), so validating the directory and then
+      # publishing it would validate one build and ship a different one.
+      - name: Pack
+        id: pack
+        run: |
+          set -euo pipefail
+          tarball="$(npm pack --silent)"
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          echo "Packed ${tarball}."
+
+      # Catches an unresolvable subpath or a missing types target — invisible to
+      # lint, typecheck, and the test suite, and only observable in the artifact.
+      # See the note in ci.yml for why cjs-resolves-to-esm is ignored and why
+      # --profile esm-only is the wrong way to silence it.
+      - name: Validate the packed tarball
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          pnpm exec attw "$TARBALL" --ignore-rules cjs-resolves-to-esm
+          pnpm exec publint --strict "$TARBALL"
+
+      - name: Extract release notes
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          awk -v heading="## [${version}]" '
+            index($0, heading) == 1 { capture = 1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md > release-notes.md
+
+          # A heading with no body passes the existence check above and would
+          # ship a release with empty notes.
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::The CHANGELOG.md section for ${version} is empty."
+            exit 1
+          fi
+
+      # No NODE_AUTH_TOKEN: credentials come from the OIDC exchange.
+      #
+      # npm's OIDC helper is written never to throw — every failure logs at
+      # verbose or silly and returns undefined, so at the default loglevel a
+      # misconfigured trusted publisher surfaces as an opaque E404 with no hint
+      # that OIDC was even attempted. verbose turns that into the actual reason.
+      # Worth the noise at least until an OIDC publish has succeeded here.
+      #
+      # Provenance: npm documents it as automatic for trusted publishing from a
+      # public repo, but it has been reported as needing to be requested. Setting
+      # it costs nothing if redundant. It lives here rather than in
+      # package.json's publishConfig so a manual publish from a laptop still
+      # works — provenance can only be generated in a trusted CI environment.
+      - name: Publish to npm
+        env:
+          NPM_CONFIG_PROVENANCE: "true"
+          NPM_CONFIG_LOGLEVEL: verbose
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          name="$(node -p "require('./package.json').name")"
+
+          # A prerelease published to `latest` would be served to everyone
+          # running a plain install; npm refuses it outright, which would fail
+          # the release minutes in. Route it to `next` instead.
+          case "$version" in
+            *-*) dist_tag=next ;;
+            *) dist_tag=latest ;;
+          esac
+
+          if npm view "${name}@${version}" version >/dev/null 2>&1; then
+            echo "::notice::${name}@${version} is already on the registry; skipping publish."
+          else
+            echo "Publishing ${name}@${version} to dist-tag ${dist_tag}."
+            npm publish "$TARBALL" --access public --tag "$dist_tag"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --notes-file release-notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file release-notes.md \
+              --verify-tag
+          fi
