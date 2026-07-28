@@ -1,6 +1,6 @@
 {
   "name": "@llbbl/polydoc-core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Reusable TypeScript Markdown-to-DOCX conversion core for polydoc and TeamWiki.",
   "type": "module",
   "license": "MIT",
@@ -56,6 +56,7 @@
   },
   "files": [
     "dist",
+    "src",
     "README.md",
     "LICENSE"
   ],
