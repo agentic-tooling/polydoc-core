@@ -20,8 +20,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Node 20 is not tested: pnpm 11 is pure ESM and requires Node >=22, so
+        # `pnpm install` cannot run on it. Node 20 reached end-of-life in April
+        # 2026, and engines.node is set to >=22 to match what is actually tested.
         node-version:
-          - 20.x
           - 22.x
           - 24.x
     steps:

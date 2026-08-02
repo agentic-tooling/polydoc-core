@@ -5,9 +5,9 @@
   "type": "module",
   "license": "MIT",
   "author": "Logan Lindquist Land",
-  "packageManager": "pnpm@10.34.5",
+  "packageManager": "pnpm@11.18.0",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "repository": {
     "type": "git",

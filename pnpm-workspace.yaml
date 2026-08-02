@@ -1,0 +1,16 @@
+# pnpm 11 supply-chain hardening.
+# These are pnpm 11's defaults, stated explicitly so the security posture is
+# visible in review and survives future changes to pnpm's own defaults.
+
+minimumReleaseAge: 1440 # block packages younger than 24h
+blockExoticSubdeps: true # no git/tarball transitive deps
+strictDepBuilds: true # fail install on unapproved postinstalls
+verifyDepsBeforeRun: install # re-check lockfile before `pnpm run`
+
+# Postinstall allowlist. Empty map = block all build scripts.
+#
+# Deliberately empty: no dependency in this tree requests a build script. With
+# strictDepBuilds enabled, `pnpm install` would fail with ERR_PNPM_IGNORED_BUILDS
+# if one appeared, so this staying empty is an enforced property, not an
+# oversight. Add an entry only after auditing that package's postinstall.
+allowBuilds: {}
