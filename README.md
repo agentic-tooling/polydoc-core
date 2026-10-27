@@ -599,7 +599,7 @@ Pandoc binary/version are expected to produce identical bytes.
 ## Requirements
 
 - Node.js 20 or newer
-- pnpm 10.34.5
+- pnpm 12.15.0
 - Pandoc 3.x for conversion
 
 ## Development
